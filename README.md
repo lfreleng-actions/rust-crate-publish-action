@@ -26,6 +26,13 @@ caller owns authentication, token scope and environment configuration.
 
 ## Usage Example
 
+Verify in one job and publish from another. The `verify` job compiles
+the crate with no credentials in reach. The `publish` job holds the
+token but compiles nothing: given `expected_sha256`, it refuses any
+archive that differs from the one `verify` checked. See
+[Credential handling](#credential-handling) for why this separation
+matters.
+
 <!-- markdownlint-disable MD013 MD046 -->
 
 ```yaml
@@ -36,7 +43,26 @@ on:
 permissions: {}
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      crate_sha256: ${{ steps.verify.outputs.crate_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Verify crate"
+        id: verify
+        uses: lfreleng-actions/rust-crate-publish-action@main
+        with:
+          release_tag: ${{ github.event.release.tag_name }}
+          dry_run: 'true'
+
   publish:
+    needs: verify
     runs-on: ubuntu-latest
     # Must match the crate's Trusted Publisher configuration
     environment: crates-io
@@ -57,6 +83,7 @@ jobs:
         with:
           release_tag: ${{ github.event.release.tag_name }}
           registry_token: ${{ steps.auth.outputs.token }}
+          expected_sha256: ${{ needs.verify.outputs.crate_sha256 }}
 ```
 
 <!-- markdownlint-enable MD013 MD046 -->
@@ -86,7 +113,14 @@ steps:
 
 Call the action once per crate, dependencies first, and select each
 member with `manifest_path`. Crates.io must list a Trusted Publisher
-for each crate:
+for each crate.
+
+This example runs in a single job, because Cargo cannot package a
+dependent crate until the dependency version it needs is on
+crates.io. So it lacks the two-job isolation described in
+[Credential handling](#credential-handling). A crate whose
+dependencies are all published already can use the two-job pattern
+instead:
 
 <!-- markdownlint-disable MD013 MD046 -->
 
@@ -118,31 +152,39 @@ for each crate:
 
 ## Requirements
 
-- Bash, `cargo` and `jq` on the runner. GitHub-hosted Ubuntu runners
-  include all three; the action fails with a clear error naming any
-  missing tool.
+- Bash, `cargo`, `jq`, `mktemp`, and `sha256sum` or `shasum`
+  on the runner. GitHub-hosted runners include them; the action
+  fails with a clear error naming any missing tool.
+- A rustup channel toolchain, if the project selects one through a
+  `rust-toolchain` file. The action refuses to upload with a
+  path-based toolchain; see
+  [Toolchain and configuration](#toolchain-and-configuration). For the
+  two-job pattern, pin an exact channel such as `1.98.1`, because
+  different Cargo versions package the same sources differently.
 - A clean git checkout. Cargo refuses to package files that git
   reports as uncommitted.
 - A committed `Cargo.lock` for crates with dependencies, since every
   Cargo stage runs with `--locked`.
-- Network access to `index.crates.io` for the dry-run stage, plus
+- Network access to `index.crates.io` for the dry run, plus
   `static.crates.io` to download dependencies and `crates.io` to
-  publish. Block-mode egress policies must admit these hosts.
+  publish. Block-mode egress policies must admit these hosts; the
+  `lfreleng-actions` allow-list does from v0.16.3.
 
 ## Inputs
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                 | Required | Default      | Description                                                                                 |
-| -------------------- | -------- | ------------ | ------------------------------------------------------------------------------------------- |
-| path_prefix          | False    | `.`          | Directory containing the crate or workspace; must resolve within the workspace              |
-| manifest_path        | False    | `Cargo.toml` | Path to the crate's `Cargo.toml`, relative to `path_prefix`                                 |
-| release_tag          | False    |              | Release tag that the `Cargo.toml` version must match, one leading `v` ignored               |
-| max_crate_size_bytes | False    | `10485760`   | Largest allowed packaged `.crate` size in bytes; the default matches the crates.io 10MB cap |
-| dry_run              | False    | `false`      | Check and package without publishing; needs no credentials                                  |
-| registry_token       | False    |              | crates.io token for the upload alone; empty falls back to the caller's Cargo credentials    |
-| permit_fail          | False    | `false`      | Report success even when a stage fails                                                      |
-| summary              | False    | `true`       | Write a crate table to the job summary                                                      |
+| Name                 | Required | Default      | Description                                                                                     |
+| -------------------- | -------- | ------------ | ----------------------------------------------------------------------------------------------- |
+| path_prefix          | False    | `.`          | Directory containing the crate or workspace; must resolve within the workspace                  |
+| manifest_path        | False    | `Cargo.toml` | Path to the crate's `Cargo.toml`, relative to `path_prefix`                                     |
+| release_tag          | False    |              | Release tag that the `Cargo.toml` version must match, one leading `v` ignored                   |
+| max_crate_size_bytes | False    | `10485760`   | Largest allowed packaged `.crate` size in bytes; the default matches the crates.io 10MB cap     |
+| dry_run              | False    | `false`      | Check and package without publishing; needs no credentials                                      |
+| registry_token       | False    |              | crates.io token for the upload alone; empty falls back to the caller's Cargo credentials        |
+| expected_sha256      | False    |              | `crate_sha256` from an earlier `dry_run` job; skips compilation and refuses a differing archive |
+| permit_fail          | False    | `false`      | Report success even when a stage fails                                                          |
+| summary              | False    | `true`       | Write a crate table to the job summary                                                          |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -158,7 +200,9 @@ value fails the run.
 | crate_name       | Crate name, read from its `Cargo.toml`                     |
 | crate_version    | Crate version, read from its `Cargo.toml`                  |
 | crate_size_bytes | Packaged `.crate` file size in bytes                       |
-| published        | `true` when the crate reached crates.io, otherwise `false` |
+| crate_sha256     | SHA-256 of the verified `.crate`, as crates.io records it  |
+| cargo_version    | Cargo version that packaged the crate                      |
+| published        | `true` when this run uploaded the crate, otherwise `false` |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -168,45 +212,128 @@ The action runs these stages in order, and the first failure stops it:
 
 1. **Check inputs**: checks booleans, the size limit and the
    release tag character set, and confirms that `path_prefix` and
-   `manifest_path` resolve within `GITHUB_WORKSPACE`.
-2. **Read crate metadata**: `cargo metadata --no-deps` selects the
+   `manifest_path` resolve within `GITHUB_WORKSPACE`. A symlinked
+   `Cargo.toml` fails, since it could point outside the workspace.
+2. **Check toolchain**: asks rustup which toolchain the project
+   selects, without running it, and pins that channel for every later
+   stage. A path-based toolchain stops any release; see below.
+3. **Read crate metadata**: `cargo metadata --no-deps` selects the
    package whose manifest matches `manifest_path`, which works for
    workspace members.
-3. **Verify release tag**: when `release_tag` holds a value, the
+4. **Verify release tag**: when `release_tag` holds a value, the
    crate version must equal it, after removing one leading `v`.
-4. **Package**: `cargo package --locked` builds the `.crate` file and
-   compiles it, proving the packaged sources build.
-5. **Check package size**: compares the `.crate` file in Cargo's
-   configured target directory against `max_crate_size_bytes`.
-6. **Dry-run publish**: `cargo publish --dry-run` runs the registry
+5. **Package**: `cargo package --locked` builds the `.crate` file and
+   compiles it, proving the packaged sources build. With
+   `expected_sha256`, it packages with `--no-verify` and compiles
+   nothing.
+6. **Check package size**: compares the `.crate` file against
+   `max_crate_size_bytes`.
+7. **Match verified digest**: with `expected_sha256`, the `.crate`
+   must match it byte for byte.
+8. **Dry-run publish**: `cargo publish --dry-run` runs the registry
    checks without uploading.
-7. **Publish**: unless `dry_run` is `true`, uploads the crate.
+9. **Confirm package unchanged**: repackages without running crate
+   code and requires a byte-identical `.crate`; see below.
+10. **Publish**: unless `dry_run` is `true`, uploads the crate.
 
-Cargo runs from `path_prefix`, so the project's `.cargo/config.toml`
-and `rust-toolchain.toml` apply.
+Packages go to a target directory the action creates, and it removes
+that directory afterwards, so the checkout stays untouched.
+
+### Toolchain and configuration
+
+Cargo reads `.cargo/config.toml` from its working directory, and
+rustup reads `rust-toolchain.toml` or `rust-toolchain` there too. Both
+come from the repository, so both could steer a credentialed Cargo
+run: a config file can route the upload through a proxy, and a
+toolchain file can name an absolute path whose `cargo` binary rustup
+then runs in place of the real one.
+
+So the action runs the compiling **Package** stage alone in
+the project directory, where the project's build configuration and
+toolchain belong. Every other stage, the upload included, runs from
+an empty directory, so no checked-in configuration reaches it.
+
+The action pins the toolchain the project selects, provided rustup
+manages it. `rustup show active-toolchain` names the selection
+without running it:
+
+<!-- markdownlint-disable MD013 -->
+
+<!-- markdownlint-disable MD013 MD060 -->
+
+| Project selects       | Plain dry run                           | Dry run with `release_tag`    | Upload                        |
+| --------------------- | --------------------------------------- | ----------------------------- | ----------------------------- |
+| A channel, or nothing | Pinned for every stage                  | Pinned for every stage        | Pinned for every stage        |
+| A path                | ⚠️ Warns; runs in the project directory | ❌ Fails before running Cargo | ❌ Fails before running Cargo |
+
+<!-- markdownlint-enable MD013 MD060 -->
+
+<!-- markdownlint-enable MD013 -->
+
+A dry run with a path toolchain holds no credentials, and no other
+toolchain can reproduce its archives, so it keeps running there.
+Nothing the repository supplies ever runs as the uploading `cargo`.
 
 ### Credential handling
 
 Packaging compiles the crate, which runs its build scripts and
-procedural macros. The action withholds credentials from that code:
+procedural macros, and those of its dependencies. Code in a job can
+reach that job's credentials: on Linux, a same-user process can read
+an ancestor's original environment through `/proc/<pid>/environ`,
+whatever later steps unset. That includes `registry_token` and, with
+`id-token: write`, the variables that mint a Trusted Publishing
+token.
 
-- `registry_token` reaches the final upload alone. The action removes
-  it from the environment before any other stage runs, and masks it
-  in the log.
-- The action also strips `CARGO_REGISTRY_TOKEN`,
-  `CARGO_REGISTRIES_CRATES_IO_TOKEN` and the GitHub OIDC request
-  variables (`ACTIONS_ID_TOKEN_REQUEST_*`) from every stage before
-  the upload. With `id-token: write`, those variables would let
-  crate code mint its own Trusted Publishing token.
-- The upload passes `--no-verify`. The package stage has already
-  compiled the same sources, so no crate code runs while a credential
-  is present.
+Isolation instead comes from separate jobs, as in the
+[usage example](#usage-example):
 
-With `registry_token` empty, the upload uses whatever credentials
-Cargo finds, such as a `CARGO_REGISTRY_TOKEN` set on the calling
-step. The action cannot hide files such as
-`$CARGO_HOME/credentials.toml` from build scripts, so prefer
-`registry_token` with a short-lived Trusted Publishing token.
+- The `verify` job runs with `dry_run: 'true'` and no credentials or
+  `id-token` permission. It compiles the crate and reports the
+  archive's `crate_sha256`.
+- The `publish` job passes that digest as `expected_sha256`. The
+  action then packages with `--no-verify`, runs no crate code, and
+  refuses to upload unless the archive matches byte for byte.
+  Cargo's archives are reproducible across checkouts, so the same
+  commit and Cargo version yield the same digest.
+
+In a single job the action still limits exposure, as defence in
+depth rather than isolation:
+
+- `registry_token` goes to the final upload alone; the action unsets
+  it before running Cargo and masks it in the log.
+- It strips `CARGO_REGISTRY_TOKEN`, `CARGO_REGISTRIES_CRATES_IO_TOKEN`
+  and the GitHub OIDC request variables (`ACTIONS_ID_TOKEN_REQUEST_*`)
+  from every Cargo stage before the upload.
+- The upload passes `--no-verify`, so it compiles nothing.
+
+With `registry_token` set, the upload also forces Cargo's built-in
+`cargo:token` credential provider. With `registry_token` empty, the
+upload uses whatever credentials and provider the caller configured.
+
+### Package integrity
+
+Cargo cannot upload a prebuilt archive: `cargo publish` always
+packages afresh. Build scripts that ran during verification could
+edit and commit the workspace sources, but Cargo's own check covers
+the unpacked copy under `target/package`, not the workspace. The
+upload would then ship sources that nobody compiled.
+
+The **Confirm package unchanged** stage closes that gap. It
+repackages with `--no-verify`, which runs no crate code, and fails
+unless the result matches the verified archive's SHA-256 byte for
+byte. Cargo's archives are reproducible and record the source
+commit, so any change to the packaged inputs alters the digest. The
+`crate_sha256` output reports that digest, which crates.io records
+as the published crate's checksum.
+
+A process started by a build script can outlive it, though, and the
+action cannot rule out changes between that stage and the upload in
+a single job. The two-job pattern avoids the question: no crate code
+ever runs in the publishing job.
+
+The action cannot hide files such as `$CARGO_HOME/credentials.toml`
+from code in the same job, so prefer `registry_token` with a
+short-lived Trusted Publishing token.
 
 ### Failure handling
 
@@ -230,14 +357,15 @@ stage that failed. The summary never includes credentials.
 `.github/workflows/testing.yaml` runs on every pull request:
 
 - Unit tests: [Bats](https://github.com/bats-core/bats-core) suites
-  in `tests/` drive `scripts/publish-crate.sh` against a Cargo
-  stand-in, covering each stage, input validation and credential
-  handling.
+  in `tests/` drive `scripts/publish-crate.sh` against stand-ins for
+  Cargo and rustup, covering each stage, input validation and
+  credential handling.
 - Dry runs against a generated two-member workspace and against
   [test-rust-project](https://github.com/lfreleng-actions/test-rust-project).
 - Failure cases, which must fail closed.
+- Release safeguards against real rustup: a path-based toolchain.
 
-Run the unit tests locally with Bats 1.5.0 or later:
+Run the unit tests locally with Bats 1.7.0 or later:
 
 ```bash
 bats tests/

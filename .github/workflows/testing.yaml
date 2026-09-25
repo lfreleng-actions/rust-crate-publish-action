@@ -34,7 +34,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -74,7 +74,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -138,13 +138,27 @@ jobs:
           release_tag: '0.1.0'
           dry_run: 'true'
 
+      # The two-job publishing pattern in one job: feed a verified run's
+      # digest back in, so the action packages without compiling.
+      - name: "Running local action: expected_sha256 from a verified run"
+        id: beta-digest
+        uses: $/
+        with:
+          path_prefix: fixture
+          manifest_path: crates/beta/Cargo.toml
+          expected_sha256: ${{ steps.beta.outputs.crate_sha256 }}
+          dry_run: 'true'
+
       - name: "Verify dry-run outputs"
         shell: bash
         env:
           BETA_NAME: ${{ steps.beta.outputs.crate_name }}
           BETA_VERSION: ${{ steps.beta.outputs.crate_version }}
           BETA_SIZE: ${{ steps.beta.outputs.crate_size_bytes }}
+          BETA_SHA256: ${{ steps.beta.outputs.crate_sha256 }}
+          DIGEST_SHA256: ${{ steps.beta-digest.outputs.crate_sha256 }}
           BETA_PUBLISHED: ${{ steps.beta.outputs.published }}
+          BETA_CARGO: ${{ steps.beta.outputs.cargo_version }}
           ALPHA_NAME: ${{ steps.alpha.outputs.crate_name }}
           ALPHA_VERSION: ${{ steps.alpha.outputs.crate_version }}
           ALPHA_PUBLISHED: ${{ steps.alpha.outputs.published }}
@@ -160,6 +174,10 @@ jobs:
           check "beta crate_name" "$BETA_NAME" lfreleng-publish-fixture-beta
           check "beta crate_version" "$BETA_VERSION" 0.2.0
           check "beta published" "$BETA_PUBLISHED" false
+          if [[ ! "$BETA_CARGO" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Unexpected beta cargo_version: '$BETA_CARGO' ❌"
+            errors=1
+          fi
           check "alpha crate_name" "$ALPHA_NAME" lfreleng-publish-fixture-alpha
           check "alpha crate_version" "$ALPHA_VERSION" 0.1.0
           check "alpha published" "$ALPHA_PUBLISHED" false
@@ -167,6 +185,12 @@ jobs:
             echo "Unexpected beta crate_size_bytes: '$BETA_SIZE' ❌"
             errors=1
           fi
+          if [[ ! "$BETA_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Unexpected beta crate_sha256: '$BETA_SHA256' ❌"
+            errors=1
+          fi
+          check "expected_sha256 run crate_sha256" \
+            "$DIGEST_SHA256" "$BETA_SHA256"
           if [ "$errors" != 0 ]; then
             echo "Workspace fixture tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
             exit 1
@@ -185,7 +209,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -204,6 +228,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: "lfreleng-actions/test-rust-project"
+          ref: "5db6f8f6624e676d1d76f8db02a0253fee39900c"  # v0.0.1
           path: "test-rust-project"
           persist-credentials: false
 
@@ -256,8 +281,8 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
 
   ### Invalid inputs and failed checks must fail closed ###
-  # Every case fails before 'cargo publish --dry-run', so this job
-  # needs no crates.io access.
+  # Every case fails before the crates.io lookup, so this job needs no
+  # crates.io access.
   test-failures:
     name: "Test: invalid inputs and error handling"
     runs-on: ubuntu-latest
@@ -268,7 +293,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
         with:
-          config: '@beca7ffe87eac9212c70fe52d0d38d3bd61bf9d1'  # v0.16.2
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
       - name: 'Harden runner (block)'
         # yamllint disable-line rule:line-length
@@ -354,6 +379,16 @@ jobs:
           max_crate_size_bytes: '1'
           dry_run: 'true'
 
+      - name: "Running local action: archive differs from expected_sha256"
+        id: digest-mismatch
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: minimal
+          # yamllint disable-line rule:line-length
+          expected_sha256: '0000000000000000000000000000000000000000000000000000000000000000'
+          dry_run: 'true'
+
       - name: "Running local action: failed check with permit_fail"
         id: permitted
         uses: $/
@@ -373,6 +408,7 @@ jobs:
           MISMATCH_OUTCOME: ${{ steps.tag-mismatch.outcome }}
           OVERSIZE_OUTCOME: ${{ steps.oversize.outcome }}
           OVERSIZE_SIZE: ${{ steps.oversize.outputs.crate_size_bytes }}
+          DIGEST_OUTCOME: ${{ steps.digest-mismatch.outcome }}
           PERMITTED_OUTCOME: ${{ steps.permitted.outcome }}
           PERMITTED_PUBLISHED: ${{ steps.permitted.outputs.published }}
         run: |
@@ -383,7 +419,8 @@ jobs:
             "manifest_path:$MANIFEST_OUTCOME" \
             "release_tag injection:$TAG_OUTCOME" \
             "release_tag mismatch:$MISMATCH_OUTCOME" \
-            "max_crate_size_bytes:$OVERSIZE_OUTCOME"; do
+            "max_crate_size_bytes:$OVERSIZE_OUTCOME" \
+            "expected_sha256:$DIGEST_OUTCOME"; do
             if [ "${pair##*:}" != failure ]; then
               echo "Case '${pair%:*}' did not fail (${pair##*:}) ❌"
               errors=1
@@ -410,3 +447,118 @@ jobs:
           fi
           echo "Failures correctly reported ✅"
           echo "Failures correctly reported ✅" >> "$GITHUB_STEP_SUMMARY"
+
+  ### Release safeguards, against real rustup ###
+  # A rust-toolchain file naming a path makes rustup run that directory's
+  # binaries as cargo, so the action must never upload with one.
+  test-safeguards:
+    name: "Test: release safeguards"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The path toolchain points at the runner's genuine stable
+      # toolchain, so rustup resolves it and only the action's policy can
+      # stop it. The fixture is committed in a repository of its own,
+      # since Cargo refuses to package uncommitted files.
+      - name: "Create fixtures"
+        shell: bash
+        run: |
+          # Create fixtures
+          set -euo pipefail
+          make_crate() {
+            mkdir -p "$1/src"
+            printf '%s\n' '[package]' "name = \"$2\"" \
+              "version = \"$3\"" 'edition = "2021"' \
+              'description = "Fixture for rust-crate-publish-action"' \
+              'license = "Apache-2.0"' > "$1/Cargo.toml"
+            : > "$1/src/lib.rs"
+            printf '%s\n' '/target' > "$1/.gitignore"
+          }
+          commit() {
+            cargo generate-lockfile --offline --manifest-path "$1/Cargo.toml"
+            git -C "$1" init -q
+            git -C "$1" add -A
+            git -C "$1" -c user.name=CI -c user.email=ci@example.org \
+              -c commit.gpgsign=false commit -q -m 'Fixture'
+          }
+          make_crate path-toolchain lfreleng-publish-fixture 1.0.0
+          active="$(rustup show active-toolchain | cut -d' ' -f1)"
+          toolchain_dir="$(rustup show home)/toolchains/$active"
+          test -x "$toolchain_dir/bin/cargo"
+          printf '%s\n' '[toolchain]' "path = \"$toolchain_dir\"" \
+            > path-toolchain/rust-toolchain.toml
+          commit path-toolchain
+
+      - name: "Running local action: path toolchain, real publish"
+        id: path-publish
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: path-toolchain
+
+      - name: "Running local action: path toolchain, release verify"
+        id: path-release
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: path-toolchain
+          release_tag: v1.0.0
+          dry_run: 'true'
+
+      - name: "Running local action: path toolchain, plain dry run"
+        id: path-dry-run
+        uses: $/
+        with:
+          path_prefix: path-toolchain
+          dry_run: 'true'
+
+      - name: "Verify safeguards"
+        shell: bash
+        env:
+          PATH_PUBLISH: ${{ steps.path-publish.outcome }}
+          PATH_PUBLISH_NAME: ${{ steps.path-publish.outputs.crate_name }}
+          PATH_RELEASE: ${{ steps.path-release.outcome }}
+          PATH_RELEASE_NAME: ${{ steps.path-release.outputs.crate_name }}
+          PATH_DRY_RUN_NAME: ${{ steps.path-dry-run.outputs.crate_name }}
+        run: |
+          # Verify safeguards
+          errors=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "Unexpected $1: '$2' (expected '$3') ❌"
+              errors=1
+            fi
+          }
+          check "path toolchain publish outcome" "$PATH_PUBLISH" failure
+          check "path toolchain release outcome" "$PATH_RELEASE" failure
+          # Refused before Cargo ran at all, so no metadata was read
+          check "path toolchain publish crate_name" "$PATH_PUBLISH_NAME" ""
+          check "path toolchain release crate_name" "$PATH_RELEASE_NAME" ""
+          check "path toolchain dry run crate_name" "$PATH_DRY_RUN_NAME" \
+            lfreleng-publish-fixture
+          if [ "$errors" != 0 ]; then
+            echo "Safeguard tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Release safeguards hold ✅"
+          echo "Release safeguards hold ✅" >> "$GITHUB_STEP_SUMMARY"
