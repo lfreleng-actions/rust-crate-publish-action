@@ -47,7 +47,7 @@ setup() {
   unset INPUT_DRY_RUN INPUT_PERMIT_FAIL INPUT_SUMMARY INPUT_REGISTRY_TOKEN
   unset INPUT_EXPECTED_SHA256 CARGO_REGISTRY_CREDENTIAL_PROVIDER
   unset MOCK_FAIL_STAGE MOCK_MISSING_PACKAGE MOCK_TAMPER MOCK_TOOLCHAIN
-  unset MOCK_INCLUDE_OTHER_PACKAGE MOCK_CARGO_VERSION
+  unset MOCK_INCLUDE_OTHER_PACKAGE MOCK_CARGO_WARNING MOCK_CARGO_VERSION
   unset MOCK_RUSTUP_FAIL CARGO_TARGET_DIR
   unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
   unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
@@ -112,7 +112,8 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   assert_calls "$publish_calls"
   [ "$(cat "$GITHUB_OUTPUT")" = "$(printf '%s\n' cargo_version=1.98.1 \
     crate_name=example-crate crate_version=1.2.3 crate_size_bytes=32 \
-    "crate_sha256=$(zero_sha256 32)" published=true)" ]
+    "crate_sha256=$(zero_sha256 32)" published=true \
+    publish_status=published)" ]
   [[ "$output" == *"Published example-crate 1.2.3 to crates.io"* ]]
 }
 
@@ -168,6 +169,7 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   assert_calls "$dry_run_calls"
   [ "$(output_value crate_size_bytes)" = 32 ]
   [ "$(output_value published)" = false ]
+  [ "$(output_value publish_status)" = dry-run ]
 }
 
 @test "dry_run still fails when package validation fails" {
@@ -176,6 +178,7 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
 
   [ "$status" -eq 1 ]
   assert_calls $'version\nmetadata\npackage'
+  [ "$(output_value publish_status)" = failed ]
 }
 
 @test "rejects non-boolean dry_run values before running anything" {
@@ -422,7 +425,7 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   [ "$status" -eq 1 ]
   [[ "$output" == *"path-based Rust toolchain"*"will not publish"* ]]
   assert_no_cargo
-  grep -Fx '| Result | Failed: Check toolchain |' "$GITHUB_STEP_SUMMARY"
+  grep -Fx '### ❌ Failed at Check toolchain' "$GITHUB_STEP_SUMMARY"
 }
 
 @test "refuses a path toolchain for a release verification dry run" {
@@ -452,6 +455,8 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   assert_calls "$dry_run_calls"
   [ "$(sort -u < <(awk -F'|' '{ print $2 }' "$MOCK_CARGO_ENV"))" = "$project" ]
   [ "$(sort -u < <(awk -F'|' '{ print $8 }' "$MOCK_CARGO_ENV"))" = unset ]
+  grep -F '| Toolchain | ⚠️ Path toolchain <code>/opt/custom</code> |' \
+    "$GITHUB_STEP_SUMMARY"
 }
 
 @test "rejects an unexpected toolchain name from rustup" {
@@ -488,6 +493,7 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
 
   [ "$status" -eq 0 ]
   [ "$(sort -u < <(awk -F'|' '{ print $8 }' "$MOCK_CARGO_ENV"))" = unset ]
+  grep -F '(no rustup)' "$GITHUB_STEP_SUMMARY"
 }
 
 ### Cargo metadata ###
@@ -523,7 +529,7 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
 
     [ "$status" -eq 1 ]
     [[ "$output" == *"cargo metadata returned an unexpected crate"* ]]
-    [ "$(cat "$GITHUB_OUTPUT")" = $'cargo_version=1.98.1\npublished=false' ]
+    [ "$(cat "$GITHUB_OUTPUT")" = $'cargo_version=1.98.1\npublished=false\npublish_status=failed' ]
     assert_calls $'version\nmetadata'
   done
 }
@@ -548,7 +554,10 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
     [ "$status" -eq 42 ]
     assert_calls "$calls"
     [ "$(output_value published)" = false ]
-    grep -Fx "| Result | Failed: $expected |" "$GITHUB_STEP_SUMMARY"
+    [ "$(output_value publish_status)" = failed ]
+    grep -F "### ❌ Failed at $expected" "$GITHUB_STEP_SUMMARY"
+    grep -Fx "$expected failed with exit status 42; see the step log for Cargo's output." \
+      "$GITHUB_STEP_SUMMARY"
   done
 }
 
@@ -580,7 +589,7 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   [ "$status" -eq 1 ]
   [[ "$output" == *"example-crate package changed after verification; not publishing"* ]]
   assert_calls "$dry_run_calls"
-  grep -Fx '| Result | Failed: Confirm package unchanged |' "$GITHUB_STEP_SUMMARY"
+  grep -F '### ❌ Failed at Confirm package unchanged' "$GITHUB_STEP_SUMMARY"
 }
 
 @test "a dry run also fails when the package changed after verification" {
@@ -601,6 +610,8 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   [ "$status" -eq 0 ]
   assert_calls $'version\nmetadata\nrepackage\ndry-run\nrepackage\npublish'
   [[ "$output" == *"example-crate package matches expected_sha256"* ]]
+  grep -F 'Matches the digest from an earlier job; not compiled here' \
+    "$GITHUB_STEP_SUMMARY"
 }
 
 @test "expected_sha256 refuses a different archive and names the cargo version" {
@@ -611,7 +622,7 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   [ "$status" -eq 1 ]
   [[ "$output" == *"does not match expected_sha256; not publishing"*"cargo 1.97.0"* ]]
   assert_calls $'version\nmetadata\nrepackage'
-  grep -Fx '| Result | Failed: Match verified digest |' "$GITHUB_STEP_SUMMARY"
+  grep -F '### ❌ Failed at Match verified digest' "$GITHUB_STEP_SUMMARY"
 }
 
 @test "a dry run's crate_sha256 feeds expected_sha256 in a later run" {
@@ -651,7 +662,8 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   [ "$status" -eq 0 ]
   [[ "$output" == *"::warning::Stage 'Verify release tag' failed (exit 1)"* ]]
   [ "$(output_value published)" = false ]
-  grep -Fx '| Result | Failed: Verify release tag (permitted) |' \
+  [ "$(output_value publish_status)" = failed ]
+  grep -Fx '### ⚠️ Failed at Verify release tag (permitted): example-crate 1.2.3' \
     "$GITHUB_STEP_SUMMARY"
 }
 
@@ -786,58 +798,89 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   [[ "$output" != *"Trusted Publisher"* ]]
 }
 
+### Cargo warnings ###
+
+@test "turns Cargo warnings into one annotation each and lists them" {
+  export MOCK_CARGO_WARNING="manifest has no license or license-file"
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | grep -c '^::warning title=cargo::manifest has no license or license-file$')" -eq 1 ]
+  [[ "$output" != *"::warning title=cargo::aborting upload"* ]]
+  grep -Fx -- '- Cargo: manifest has no license or license-file' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "encodes percent signs in Cargo warning annotations" {
+  export MOCK_CARGO_WARNING="100% odd"
+  run_action
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"::warning title=cargo::100%25 odd"* ]]
+}
+
 ### Job summary ###
 
-@test "successful publish writes the complete summary table" {
+@test "a successful publish writes the complete summary" {
   export INPUT_RELEASE_TAG=v1.2.3
   run_action
 
   [ "$status" -eq 0 ]
-  expected=$(cat << 'MARKDOWN'
+  local sha
+  sha="$(zero_sha256 32)"
+  expected=$(cat << MARKDOWN
 
-### Crate publishing
+## 🦀 Rust Crate Publish
 
-| Field | Value |
+### 🚀 Published: example-crate 1.2.3
+
+| Check | Result |
 | --- | --- |
-| Crate | example-crate |
-| Version | 1.2.3 |
-| Release-tag check | Matched |
-| Package size | 32 bytes |
-| Size limit | 10485760 bytes |
-| Result | Published |
+| Mode | Publish to crates.io |
+| Manifest | <code>member crate/Cargo.toml</code> |
+| Toolchain | <code>cargo 1.98.1</code> via <code>stable-x86_64-unknown-linux-gnu</code> |
+| Release tag | ✅ <code>v1.2.3</code> matches |
+| Verification | ✅ Compiled and verified in this job |
+| Package size | ✅ 32 B of the 10.0 MiB limit |
+| SHA-256 | <code>$sha</code> |
+| Link | 🔗 https://crates.io/crates/example-crate/1.2.3 |
 MARKDOWN
   )
   [ "$(cat "$GITHUB_STEP_SUMMARY")" = "$expected" ]
 }
 
-@test "dry-run summary distinguishes skipped tags and never claims publication" {
+@test "a dry run summary never claims publication" {
   export INPUT_DRY_RUN=true
   run_action
 
   [ "$status" -eq 0 ]
-  grep -Fx '| Release-tag check | Skipped |' "$GITHUB_STEP_SUMMARY"
-  grep -Fx '| Result | Dry-run passed |' "$GITHUB_STEP_SUMMARY"
-  run ! grep -q Published "$GITHUB_STEP_SUMMARY"
+  grep -Fx '### ✅ Dry run passed: example-crate 1.2.3' "$GITHUB_STEP_SUMMARY"
+  grep -F '| Mode | Dry run: nothing uploaded |' "$GITHUB_STEP_SUMMARY"
+  grep -F '| Release tag | ➖ Not requested |' "$GITHUB_STEP_SUMMARY"
+  run ! grep -q -e 'Published' -e '| Link |' "$GITHUB_STEP_SUMMARY"
 }
 
-@test "tag mismatch summary marks failure before package measurement" {
+@test "a tag mismatch summary explains the failure and marks later checks" {
   export INPUT_RELEASE_TAG=v9.0.0
   run_action
 
   [ "$status" -eq 1 ]
-  grep -Fx '| Release-tag check | Failed |' "$GITHUB_STEP_SUMMARY"
-  grep -Fx '| Package size | Not measured |' "$GITHUB_STEP_SUMMARY"
-  grep -Fx '| Result | Failed: Verify release tag |' "$GITHUB_STEP_SUMMARY"
+  grep -Fx '### ❌ Failed at Verify release tag: example-crate 1.2.3' \
+    "$GITHUB_STEP_SUMMARY"
+  grep -Fx 'example-crate Cargo.toml version (1.2.3) does not match release tag (9.0.0)' \
+    "$GITHUB_STEP_SUMMARY"
+  grep -F '| Release tag | ❌ <code>v9.0.0</code> does not match <code>1.2.3</code> |' \
+    "$GITHUB_STEP_SUMMARY"
+  grep -F '| Package size | ⏸️ Not reached |' "$GITHUB_STEP_SUMMARY"
 }
 
-@test "oversize summary includes measured size and custom limit" {
-  export INPUT_MAX_CRATE_SIZE_BYTES=31
+@test "an oversize summary reports readable sizes" {
+  export MOCK_CRATE_SIZE=2097152 INPUT_MAX_CRATE_SIZE_BYTES=1048576
   run_action
 
   [ "$status" -eq 1 ]
-  grep -Fx '| Package size | 32 bytes |' "$GITHUB_STEP_SUMMARY"
-  grep -Fx '| Size limit | 31 bytes |' "$GITHUB_STEP_SUMMARY"
-  grep -Fx '| Result | Failed: Check package size |' "$GITHUB_STEP_SUMMARY"
+  grep -F '| Package size | ❌ 2.0 MiB, over the 1.0 MiB limit |' \
+    "$GITHUB_STEP_SUMMARY"
 }
 
 @test "summary 'false' writes no summary" {
@@ -856,10 +899,10 @@ MARKDOWN
   run_action
 
   [ "$status" -eq 0 ]
-  [ "$(grep -c '^### Crate publishing$' "$GITHUB_STEP_SUMMARY")" -eq 2 ]
+  [ "$(grep -c '^## 🦀 Rust Crate Publish$' "$GITHUB_STEP_SUMMARY")" -eq 2 ]
   grep -Fx 'Existing job notes' "$GITHUB_STEP_SUMMARY"
-  grep -Fx '| Result | Published |' "$GITHUB_STEP_SUMMARY"
-  grep -Fx '| Result | Dry-run passed |' "$GITHUB_STEP_SUMMARY"
+  grep -F '### 🚀 Published' "$GITHUB_STEP_SUMMARY"
+  grep -F '### ✅ Dry run passed' "$GITHUB_STEP_SUMMARY"
 }
 
 @test "local runs without GitHub output or summary paths still succeed" {
@@ -882,13 +925,19 @@ MARKDOWN
   [[ "$output" == *"::warning::Could not write crate publishing job summary"* ]]
 }
 
-@test "summary escapes table delimiters, markup and newlines" {
+@test "summary helpers escape markup and format sizes" {
   # shellcheck disable=SC2016 # expanded by the inner shell
-  run "$BASH" -c 'source "$1"; summary_cell "$2"' -- \
+  run "$BASH" -c 'source "$1"; summary_cell "$2"; echo; summary_code "$2"' -- \
     "$repo_dir/scripts/job-summary.sh" $'<tag> & | `value`\r\nnext'
 
   [ "$status" -eq 0 ]
-  [ "$output" = '&lt;tag&gt; &amp; &#124; &#96;value&#96;  next' ]
+  [ "${lines[0]}" = '&lt;tag&gt; &amp; &#124; &#96;value&#96;  next' ]
+  [ "${lines[1]}" = '<code>&lt;tag&gt; &amp; &#124; &#96;value&#96;  next</code>' ]
+
+  # shellcheck disable=SC2016 # expanded by the inner shell
+  run "$BASH" -c 'source "$1"; for b in 0 1023 1024 1536 10485760 1073741824; do human_bytes "$b"; echo; done' -- \
+    "$repo_dir/scripts/job-summary.sh"
+  [ "$output" = $'0 B\n1023 B\n1.0 KiB\n1.5 KiB\n10.0 MiB\n1.0 GiB' ]
 }
 
 @test "summary contains no credentials or authentication claims" {

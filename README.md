@@ -202,6 +202,7 @@ value fails the run.
 | crate_size_bytes | Packaged `.crate` file size in bytes                       |
 | crate_sha256     | SHA-256 of the verified `.crate`, as crates.io records it  |
 | cargo_version    | Cargo version that packaged the crate                      |
+| publish_status   | Outcome: `published`, `dry-run` or `failed`                |
 | published        | `true` when this run uploaded the crate, otherwise `false` |
 
 <!-- markdownlint-enable MD013 -->
@@ -348,9 +349,38 @@ configuration binds a token to.
 
 ### Job summary
 
-Each call appends a table with the crate name, version, release-tag
-check, package size, size limit and result. A failed run names the
-stage that failed. The summary never includes credentials.
+Each call appends a section to the job summary: a headline with the
+outcome, the reason for any failure, a table of checks, and a list of
+warnings, Cargo's own included. For example:
+
+<!-- markdownlint-disable MD013 MD033 -->
+
+```markdown
+## 🦀 Rust Crate Publish
+
+### ✅ Dry run passed: lfreleng-test-rust-project 0.1.0
+
+<!-- markdownlint-disable MD013 MD060 -->
+
+| Check        | Result                                                                        |
+| ------------ | ----------------------------------------------------------------------------- |
+| Mode         | Dry run: nothing uploaded                                                     |
+| Manifest     | <code>test-rust-project/Cargo.toml</code>                                     |
+| Toolchain    | <code>cargo 1.98.1</code> via <code>stable-x86_64-unknown-linux-gnu</code>    |
+| Release tag  | ✅ <code>v0.1.0</code> matches                                                |
+| Verification | ✅ Compiled and verified in this job                                          |
+| Package size | ✅ 6.8 KiB of the 10.0 MiB limit                                              |
+| SHA-256      | <code>3c8bdba0cee1a8887ae312331ca76aff760f3d4e82787aefd71ae848aee6176e</code> |
+
+<!-- markdownlint-enable MD013 MD060 -->
+```
+
+<!-- markdownlint-enable MD013 MD033 -->
+
+Headlines distinguish 🚀 published, ✅ dry run passed, and ❌ failed
+at a named stage, with ⚠️ marking a failure that `permit_fail` let
+through. Checks the run never reached read "Not reached". A published
+crate links to its crates.io page. The summary never includes credentials.
 
 ## Testing
 
@@ -358,8 +388,8 @@ stage that failed. The summary never includes credentials.
 
 - Unit tests: [Bats](https://github.com/bats-core/bats-core) suites
   in `tests/` drive `scripts/publish-crate.sh` against stand-ins for
-  Cargo and rustup, covering each stage, input validation and
-  credential handling.
+  Cargo and rustup, covering each stage, input validation, credential
+  handling and the summary.
 - Dry runs against a generated two-member workspace and against
   [test-rust-project](https://github.com/lfreleng-actions/test-rust-project).
 - Failure cases, which must fail closed.

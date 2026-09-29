@@ -78,6 +78,12 @@ if [ "${MOCK_FAIL_STAGE:-}" = "$stage" ]; then
   exit 42
 fi
 
+if [ -n "${MOCK_CARGO_WARNING:-}" ]; then
+  case "$stage" in
+    package | dry-run) echo "warning: $MOCK_CARGO_WARNING" >&2 ;;
+  esac
+fi
+
 crate_file() {
   printf '%s/package/%s.crate' "$target" \
     "$(jq -r '.name + "-" + .version' "$MOCK_MANIFEST_JSON")"
