@@ -158,6 +158,7 @@ jobs:
           BETA_SHA256: ${{ steps.beta.outputs.crate_sha256 }}
           DIGEST_SHA256: ${{ steps.beta-digest.outputs.crate_sha256 }}
           BETA_PUBLISHED: ${{ steps.beta.outputs.published }}
+          BETA_STATUS: ${{ steps.beta.outputs.publish_status }}
           BETA_CARGO: ${{ steps.beta.outputs.cargo_version }}
           ALPHA_NAME: ${{ steps.alpha.outputs.crate_name }}
           ALPHA_VERSION: ${{ steps.alpha.outputs.crate_version }}
@@ -174,6 +175,7 @@ jobs:
           check "beta crate_name" "$BETA_NAME" lfreleng-publish-fixture-beta
           check "beta crate_version" "$BETA_VERSION" 0.2.0
           check "beta published" "$BETA_PUBLISHED" false
+          check "beta publish_status" "$BETA_STATUS" dry-run
           if [[ ! "$BETA_CARGO" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
             echo "Unexpected beta cargo_version: '$BETA_CARGO' ❌"
             errors=1
@@ -539,7 +541,7 @@ jobs:
           PATH_PUBLISH_NAME: ${{ steps.path-publish.outputs.crate_name }}
           PATH_RELEASE: ${{ steps.path-release.outcome }}
           PATH_RELEASE_NAME: ${{ steps.path-release.outputs.crate_name }}
-          PATH_DRY_RUN_NAME: ${{ steps.path-dry-run.outputs.crate_name }}
+          PATH_DRY_RUN_STATUS: ${{ steps.path-dry-run.outputs.publish_status }}
         run: |
           # Verify safeguards
           errors=0
@@ -554,8 +556,7 @@ jobs:
           # Refused before Cargo ran at all, so no metadata was read
           check "path toolchain publish crate_name" "$PATH_PUBLISH_NAME" ""
           check "path toolchain release crate_name" "$PATH_RELEASE_NAME" ""
-          check "path toolchain dry run crate_name" "$PATH_DRY_RUN_NAME" \
-            lfreleng-publish-fixture
+          check "path toolchain dry run status" "$PATH_DRY_RUN_STATUS" dry-run
           if [ "$errors" != 0 ]; then
             echo "Safeguard tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
             exit 1

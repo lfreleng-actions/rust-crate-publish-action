@@ -46,25 +46,32 @@ crate_version=""
 crate_size=""
 crate_sha256=""
 cargo_version=""
+manifest_display=""
 toolchain=""
 toolchain_kind=""
 toolchain_pin=""
 published="false"
+publish_status=""
 stage="Check inputs"
-tag_result="Skipped"
-if [ -n "$release_tag" ]; then
-  tag_result="Not checked"
-fi
-result="Dry-run passed"
+failure_reason=""
 failures_permitted="false"
 work_dir=""
+if [ -n "$release_tag" ]; then
+  tag_cell="⏸️ Not reached"
+else
+  tag_cell="➖ Not requested"
+fi
+verification_cell="⏸️ Not reached"
+size_cell="⏸️ Not reached"
 
 fail() {
+  failure_reason="$*"
   echo "::error::$*"
   exit 1
 }
 
 warn() {
+  summary_note "$*"
   echo "::warning::$*"
 }
 
@@ -74,22 +81,72 @@ write_output() {
   fi
 }
 
+render_summary() {
+  local status="$1" outcome="" subject="" link=""
+  if [ -n "$crate_name" ] && [ -n "$crate_version" ]; then
+    subject=": $(summary_cell "$crate_name $crate_version")"
+    link="https://crates.io/crates/$crate_name/$crate_version"
+  fi
+  if [ "$status" -ne 0 ]; then
+    if [ "$failures_permitted" = "true" ]; then
+      outcome="⚠️ Failed at $(summary_cell "$stage") (permitted)$subject"
+    else
+      outcome="❌ Failed at $(summary_cell "$stage")$subject"
+    fi
+  else
+    case "$publish_status" in
+      published) outcome="🚀 Published$subject" ;;
+      *) outcome="✅ Dry run passed$subject" ;;
+    esac
+  fi
+
+  if [ "$dry_run" = "true" ]; then
+    summary_row "Mode" "Dry run: nothing uploaded"
+  else
+    summary_row "Mode" "Publish to crates.io"
+  fi
+  if [ -n "$manifest_display" ]; then
+    summary_row "Manifest" "$(summary_code "$manifest_display")"
+  fi
+  case "$toolchain_kind" in
+    channel) summary_row "Toolchain" \
+      "$(summary_code "cargo ${cargo_version:-unknown}") via $(summary_code "$toolchain")" ;;
+    path) summary_row "Toolchain" \
+      "⚠️ Path toolchain $(summary_code "$toolchain")" ;;
+    none) summary_row "Toolchain" \
+      "$(summary_code "cargo ${cargo_version:-unknown}") (no rustup)" ;;
+  esac
+  summary_row "Release tag" "$tag_cell"
+  summary_row "Verification" "$verification_cell"
+  summary_row "Package size" "$size_cell"
+  if [ -n "$crate_sha256" ]; then
+    summary_row "SHA-256" "$(summary_code "$crate_sha256")"
+  fi
+  if [ "$status" -eq 0 ] && [ -n "$link" ] \
+    && [ "$publish_status" = "published" ]; then
+    summary_row "Link" "🔗 $link"
+  fi
+  write_summary "$outcome" "$failure_reason"
+}
+
 finish() {
   local status=$?
   trap - EXIT
   if [ "$status" -ne 0 ]; then
-    result="Failed: $stage"
-    if [ "$stage" = "Verify release tag" ]; then
-      tag_result="Failed"
+    publish_status="failed"
+    if [ -z "$failure_reason" ]; then
+      failure_reason="$stage failed with exit status $status; see the step log for Cargo's output."
     fi
     if [ "$failures_permitted" = "true" ]; then
-      result="$result (permitted)"
+      failure_reason="$failure_reason permit_fail is 'true', so the step reports success."
     fi
+  elif [ -z "$publish_status" ]; then
+    publish_status="dry-run"
   fi
   write_output published "$published"
+  write_output publish_status "$publish_status"
   if [ "$summary" = "true" ]; then
-    write_summary "$crate_name" "$crate_version" "$tag_result" \
-      "$crate_size" "$max_bytes" "$result"
+    render_summary "$status"
   fi
   if [ -n "$work_dir" ] && [ -d "$work_dir" ]; then
     rm -rf -- "$work_dir"
@@ -129,6 +186,28 @@ project_cargo() {
 
 trusted_cargo() {
   run_cargo_in "$trusted_dir" "$@"
+}
+
+# Run cargo, echoing its output, and turn its 'warning:' lines into
+# annotations. The dry run's abort notice is left out.
+cargo_with_annotations() {
+  local context="$1" log="$work_dir/cargo.log" line message
+  shift
+  : > "$log"
+  "$context" "$@" 2>&1 | tee "$log"
+  while IFS= read -r line; do
+    case "$line" in
+      "warning: aborting upload due to dry run"*) continue ;;
+    esac
+    message="${line#warning: }"
+    if grep -Fqx -- "$message" "$work_dir/warnings.seen" 2> /dev/null; then
+      continue
+    fi
+    printf '%s\n' "$message" >> "$work_dir/warnings.seen"
+    summary_note "Cargo: $message"
+    message=${message//%/%25}
+    echo "::warning title=cargo::$message"
+  done < <(grep '^warning: ' "$log" || true)
 }
 
 # A prefix assignment on 'exec', rather than an 'env NAME=value'
@@ -267,6 +346,7 @@ fi
 manifest_dir="$(cd -- "$(dirname -- "$manifest_file")" && pwd -P)"
 manifest_abs="$manifest_dir/Cargo.toml"
 require_within_workspace manifest_path "$manifest_abs"
+manifest_display="${manifest_abs#"$workspace_real"/}"
 
 # add-mask applies per line, so a multi-line value would leak its tail.
 case "$registry_token" in
@@ -385,10 +465,11 @@ stage="Verify release tag"
 if [ -n "$release_tag" ]; then
   expected="${release_tag#v}"
   if [ "$crate_version" != "$expected" ]; then
+    tag_cell="❌ $(summary_code "$release_tag") does not match $(summary_code "$crate_version")"
     fail "$crate_name Cargo.toml version ($crate_version) does not" \
       "match release tag ($expected)"
   fi
-  tag_result="Matched"
+  tag_cell="✅ $(summary_code "$release_tag") matches"
   echo "$crate_name version $crate_version matches release tag ✅"
 fi
 
@@ -402,9 +483,11 @@ crate_file="$package_target/package/$crate_name-$crate_version.crate"
 if [ -n "$expected_sha256" ]; then
   trusted_cargo package --no-verify --locked --target-dir "$package_target" \
     --manifest-path "$manifest_abs"
+  verification_cell="⏸️ Awaiting digest match"
 else
-  project_cargo package --locked --target-dir "$package_target" \
-    --manifest-path "$manifest_abs"
+  cargo_with_annotations project_cargo package --locked \
+    --target-dir "$package_target" --manifest-path "$manifest_abs"
+  verification_cell="✅ Compiled and verified in this job"
 fi
 
 ### Check package size ###
@@ -421,20 +504,24 @@ write_output crate_sha256 "$crate_sha256"
 echo "$crate_name package size: $crate_size bytes (limit: $max_bytes)"
 echo "$crate_name package SHA-256: $crate_sha256"
 if [ "$crate_size" -gt "$max_bytes" ]; then
+  size_cell="❌ $(human_bytes "$crate_size"), over the $(human_bytes "$max_bytes") limit"
   fail "$crate_name package is $crate_size bytes, exceeding the" \
     "$max_bytes-byte limit"
 fi
+size_cell="✅ $(human_bytes "$crate_size") of the $(human_bytes "$max_bytes") limit"
 
 ### Match verified digest ###
 
 if [ -n "$expected_sha256" ]; then
   stage="Match verified digest"
   if [ "$crate_sha256" != "$expected_sha256" ]; then
+    verification_cell="❌ Differs from the verified digest"
     fail "$crate_name package does not match expected_sha256; not" \
       "publishing. This job packaged it with cargo $cargo_version; if" \
       "the verifying job's cargo_version output differs, pin an exact" \
       "toolchain channel."
   fi
+  verification_cell="✅ Matches the digest from an earlier job; not compiled here"
   echo "$crate_name package matches expected_sha256 ✅"
 fi
 
@@ -442,7 +529,7 @@ fi
 
 # Registry-side checks only: nothing here compiles.
 stage="Dry-run publish"
-trusted_cargo publish --dry-run --no-verify --locked \
+cargo_with_annotations trusted_cargo publish --dry-run --no-verify --locked \
   --registry crates-io --target-dir "$package_target" \
   --manifest-path "$manifest_abs"
 
@@ -475,5 +562,5 @@ describe_trusted_publisher
 publishing_cargo publish --no-verify --locked --registry crates-io \
   --target-dir "$package_target" --manifest-path "$manifest_abs"
 published="true"
-result="Published"
+publish_status="published"
 echo "Published $crate_name $crate_version to crates.io ✅"

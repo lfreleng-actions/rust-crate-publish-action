@@ -76,6 +76,10 @@ outputs:
   cargo_version:
     description: "Cargo version that packaged the crate"
     value: ${{ steps.publish.outputs.cargo_version }}
+  publish_status:
+    # yamllint disable-line rule:line-length
+    description: "Outcome: 'published', 'dry-run' or 'failed'"
+    value: ${{ steps.publish.outputs.publish_status }}
   published:
     description: "'true' when the crate reached crates.io, otherwise 'false'"
     value: ${{ steps.publish.outputs.published }}
