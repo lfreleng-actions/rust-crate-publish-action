@@ -10,7 +10,7 @@
 #
 #   Check inputs -> Check toolchain -> Read crate metadata
 #   -> Verify release tag -> Package -> Check package size
-#   -> Match verified digest -> Dry-run publish
+#   -> Match verified digest -> Check crates.io -> Dry-run publish
 #   -> Confirm package unchanged -> Publish
 #
 # The compiling 'Package' stage runs in the project directory, so the
@@ -41,6 +41,9 @@ registry_token="${INPUT_REGISTRY_TOKEN:-}"
 # ancestor's /proc/<pid>/environ; see expected_sha256 for isolation.
 unset INPUT_REGISTRY_TOKEN
 
+readonly index_url="https://index.crates.io"
+readonly user_agent="rust-crate-publish-action (https://github.com/lfreleng-actions/rust-crate-publish-action)"
+
 crate_name=""
 crate_version=""
 crate_size=""
@@ -50,6 +53,8 @@ manifest_display=""
 toolchain=""
 toolchain_kind=""
 toolchain_pin=""
+registry_status=""
+published_sha256=""
 published="false"
 publish_status=""
 stage="Check inputs"
@@ -63,6 +68,7 @@ else
 fi
 verification_cell="⏸️ Not reached"
 size_cell="⏸️ Not reached"
+registry_cell="⏸️ Not reached"
 
 fail() {
   failure_reason="$*"
@@ -96,6 +102,7 @@ render_summary() {
   else
     case "$publish_status" in
       published) outcome="🚀 Published$subject" ;;
+      skipped) outcome="⛔️ Skipped: previously published$subject" ;;
       *) outcome="✅ Dry run passed$subject" ;;
     esac
   fi
@@ -119,11 +126,13 @@ render_summary() {
   summary_row "Release tag" "$tag_cell"
   summary_row "Verification" "$verification_cell"
   summary_row "Package size" "$size_cell"
+  summary_row "crates.io" "$registry_cell"
   if [ -n "$crate_sha256" ]; then
     summary_row "SHA-256" "$(summary_code "$crate_sha256")"
   fi
   if [ "$status" -eq 0 ] && [ -n "$link" ] \
-    && [ "$publish_status" = "published" ]; then
+    && { [ "$publish_status" = "published" ] \
+      || [ "$publish_status" = "skipped" ]; }; then
     summary_row "Link" "🔗 $link"
   fi
   write_summary "$outcome" "$failure_reason"
@@ -189,7 +198,8 @@ trusted_cargo() {
 }
 
 # Run cargo, echoing its output, and turn its 'warning:' lines into
-# annotations. The dry run's abort notice is left out.
+# annotations. The dry run's abort notice and its already-published
+# warning are left out: the action reports both itself.
 cargo_with_annotations() {
   local context="$1" log="$work_dir/cargo.log" line message
   shift
@@ -197,7 +207,8 @@ cargo_with_annotations() {
   "$context" "$@" 2>&1 | tee "$log"
   while IFS= read -r line; do
     case "$line" in
-      "warning: aborting upload due to dry run"*) continue ;;
+      "warning: aborting upload due to dry run"* \
+        | *"already exists on crates.io index"*) continue ;;
     esac
     message="${line#warning: }"
     if grep -Fqx -- "$message" "$work_dir/warnings.seen" 2> /dev/null; then
@@ -270,6 +281,73 @@ sha256_of() {
   printf '%s' "${digest%% *}"
 }
 
+# Sparse index location of a crate, per the Cargo registry index
+# layout: 1/, 2/, 3/<first char>/, otherwise <two>/<two>/.
+index_path() {
+  local name
+  name="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "${#name}" in
+    1) printf '1/%s' "$name" ;;
+    2) printf '2/%s' "$name" ;;
+    3) printf '3/%s/%s' "${name:0:1}" "$name" ;;
+    *) printf '%s/%s/%s' "${name:0:2}" "${name:2:2}" "$name" ;;
+  esac
+}
+
+# Look this version up in the crates.io index and compare its recorded
+# checksum, the SHA-256 of the published .crate, with ours. Sets
+# registry_status to absent, identical or different. On any failure it
+# sets lookup_error and returns 1, leaving the caller to decide.
+lookup_registry() {
+  local body="$work_dir/index.json" code entry
+  lookup_error=""
+  if ! code="$(curl -sS --retry 3 -A "$user_agent" -o "$body" \
+    -w '%{http_code}' "$index_url/$(index_path "$crate_name")")"; then
+    lookup_error="could not reach the crates.io index for $crate_name"
+    return 1
+  fi
+  case "$code" in
+    404)
+      registry_status="absent"
+      return 0
+      ;;
+    200) ;;
+    *)
+      lookup_error="the crates.io index answered HTTP $code for $crate_name"
+      return 1
+      ;;
+  esac
+  # crates.io rejects versions differing only in build metadata, so
+  # compare without it.
+  if ! entry="$(jq -c --arg v "${crate_version%%+*}" \
+    'select((.vers | split("+")[0]) == $v)' "$body")"; then
+    lookup_error="could not parse the crates.io index entry for $crate_name"
+    return 1
+  fi
+  entry="${entry%%$'\n'*}"
+  if [ -z "$entry" ]; then
+    registry_status="absent"
+    return 0
+  fi
+  published_sha256="$(jq -r '.cksum // empty' <<< "$entry")"
+  if [[ ! "$published_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    lookup_error="the crates.io index has no valid checksum for $crate_name $crate_version"
+    return 1
+  fi
+  if [ "$published_sha256" = "$crate_sha256" ]; then
+    registry_status="identical"
+  else
+    registry_status="different"
+  fi
+}
+
+# The check before an upload fails closed.
+query_registry() {
+  if ! lookup_registry; then
+    fail "$lookup_error"
+  fi
+}
+
 # A crates.io token for Trusted Publishing is bound to the repository,
 # workflow file and optional environment. Name the first two, so a
 # rejected token can be checked against the crate's publisher settings.
@@ -306,7 +384,7 @@ if [ -n "$expected_sha256" ] \
   fail "expected_sha256 must be 64 lowercase hexadecimal characters"
 fi
 
-for tool in cargo jq wc mktemp; do
+for tool in cargo jq wc curl mktemp; do
   if ! command -v "$tool" > /dev/null 2>&1; then
     fail "required tool not found on PATH: $tool"
   fi
@@ -521,6 +599,42 @@ if [ -n "$expected_sha256" ]; then
   echo "$crate_name package matches expected_sha256 ✅"
 fi
 
+### Check crates.io ###
+
+# crates.io never lets a version be replaced, even once yanked. The
+# same bytes there already mean a re-run: skip. Different bytes mean
+# the version is taken: fail a release, warn an ordinary dry run.
+stage="Check crates.io"
+query_registry
+case "$registry_status" in
+  absent)
+    registry_cell="✅ Version not yet published"
+    ;;
+  identical)
+    registry_cell="✅ Already published, identical archive"
+    if [ "$dry_run" = "false" ]; then
+      write_output registry_status "$registry_status"
+      publish_status="skipped"
+      echo "$crate_name $crate_version is already on crates.io with" \
+        "identical content; skipping the upload ⛔️"
+      exit 0
+    fi
+    ;;
+  different)
+    if [ "$release_intent" = "true" ]; then
+      registry_cell="❌ Already published with different content"
+      write_output registry_status "$registry_status"
+      fail "$crate_name $crate_version is already on crates.io with" \
+        "different content (published SHA-256 $published_sha256)." \
+        "crates.io never replaces a version: release a new one."
+    fi
+    registry_cell="⚠️ Already published with different content"
+    warn "$crate_name $crate_version is already on crates.io with" \
+      "different content; bump the version before releasing."
+    ;;
+esac
+write_output registry_status "$registry_status"
+
 ### Dry-run publish ###
 
 # Registry-side checks only: nothing here compiles.
@@ -555,8 +669,24 @@ fi
 
 stage="Publish"
 describe_trusted_publisher
+upload_status=0
 publishing_cargo publish --no-verify --locked --registry crates-io \
-  --target-dir "$package_target" --manifest-path "$manifest_abs"
+  --target-dir "$package_target" --manifest-path "$manifest_abs" \
+  || upload_status=$?
+if [ "$upload_status" -ne 0 ]; then
+  # An earlier attempt may have uploaded these exact bytes before
+  # failing, and the index may only now show them. Best effort: unless
+  # the index positively shows this archive, keep Cargo's own failure.
+  if lookup_registry && [ "$registry_status" = "identical" ]; then
+    registry_cell="✅ Already published, identical archive"
+    write_output registry_status "$registry_status"
+    publish_status="skipped"
+    warn "The upload failed, but crates.io already holds this exact" \
+      "archive, likely from an earlier attempt; treating it as published."
+    exit 0
+  fi
+  exit "$upload_status"
+fi
 published="true"
 publish_status="published"
 echo "Published $crate_name $crate_version to crates.io ✅"

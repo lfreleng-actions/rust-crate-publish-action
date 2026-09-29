@@ -152,7 +152,7 @@ instead:
 
 ## Requirements
 
-- Bash, `cargo`, `jq`, `mktemp`, and `sha256sum` or `shasum`
+- Bash, `cargo`, `jq`, `curl`, `mktemp`, and `sha256sum` or `shasum`
   on the runner. GitHub-hosted runners include them; the action
   fails with a clear error naming any missing tool.
 - A rustup channel toolchain, if the project selects one through a
@@ -165,10 +165,10 @@ instead:
   reports as uncommitted.
 - A committed `Cargo.lock` for crates with dependencies, since every
   Cargo stage runs with `--locked`.
-- Network access to `index.crates.io` for the dry run, plus
-  `static.crates.io` to download dependencies and `crates.io` to
-  publish. Block-mode egress policies must admit these hosts; the
-  `lfreleng-actions` allow-list does from v0.16.3.
+- Network access to `index.crates.io` for the version check and the
+  dry run, plus `static.crates.io` to download dependencies and
+  `crates.io` to publish. Block-mode egress policies must admit these
+  hosts; the `lfreleng-actions` allow-list does from v0.16.3.
 
 ## Inputs
 
@@ -195,15 +195,16 @@ value fails the run.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name             | Description                                                |
-| ---------------- | ---------------------------------------------------------- |
-| crate_name       | Crate name, read from its `Cargo.toml`                     |
-| crate_version    | Crate version, read from its `Cargo.toml`                  |
-| crate_size_bytes | Packaged `.crate` file size in bytes                       |
-| crate_sha256     | SHA-256 of the verified `.crate`, as crates.io records it  |
-| cargo_version    | Cargo version that packaged the crate                      |
-| publish_status   | Outcome: `published`, `dry-run` or `failed`                |
-| published        | `true` when this run uploaded the crate, otherwise `false` |
+| Name             | Description                                                                              |
+| ---------------- | ---------------------------------------------------------------------------------------- |
+| crate_name       | Crate name, read from its `Cargo.toml`                                                   |
+| crate_version    | Crate version, read from its `Cargo.toml`                                                |
+| crate_size_bytes | Packaged `.crate` file size in bytes                                                     |
+| crate_sha256     | SHA-256 of the verified `.crate`, as crates.io records it                                |
+| cargo_version    | Cargo version that packaged the crate                                                    |
+| registry_status  | This version on crates.io: `absent`, `identical` (same archive) or `different`           |
+| publish_status   | Outcome: `published`, `skipped` (identical archive already there), `dry-run` or `failed` |
+| published        | `true` when this run uploaded the crate; `false` for a skip too, see `publish_status`    |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -231,11 +232,13 @@ The action runs these stages in order, and the first failure stops it:
    `max_crate_size_bytes`.
 7. **Match verified digest**: with `expected_sha256`, the `.crate`
    must match it byte for byte.
-8. **Dry-run publish**: `cargo publish --dry-run` runs the registry
+8. **Check crates.io**: looks the version up in the crates.io index
+   and compares its recorded checksum with the `.crate`; see below.
+9. **Dry-run publish**: `cargo publish --dry-run` runs the registry
    checks without uploading.
-9. **Confirm package unchanged**: repackages without running crate
-   code and requires a byte-identical `.crate`; see below.
-10. **Publish**: unless `dry_run` is `true`, uploads the crate.
+10. **Confirm package unchanged**: repackages without running crate
+    code and requires a byte-identical `.crate`; see below.
+11. **Publish**: unless `dry_run` is `true`, uploads the crate.
 
 Packages go to a target directory the action creates, and it removes
 that directory afterwards, so the checkout stays untouched.
@@ -274,6 +277,36 @@ without running it:
 A dry run with a path toolchain holds no credentials, and no other
 toolchain can reproduce its archives, so it keeps running there.
 Nothing the repository supplies ever runs as the uploading `cargo`.
+
+### Already published versions
+
+crates.io never lets anyone replace a version, even once yanked. Before
+the dry run, the action looks the version up in the crates.io index,
+whose recorded checksum is the SHA-256 of the published `.crate`, and
+compares it with `crate_sha256`:
+
+<!-- markdownlint-disable MD013 -->
+
+<!-- markdownlint-disable MD013 MD060 -->
+
+| On crates.io      | Plain dry run             | Dry run with `release_tag` | Upload                             |
+| ----------------- | ------------------------- | -------------------------- | ---------------------------------- |
+| Absent            | ✅ Pass                   | ✅ Pass                    | Upload                             |
+| Identical archive | ✅ Pass                   | ✅ Pass                    | ⛔️ Skip, `publish_status: skipped` |
+| Different content | ⚠️ Warn: bump the version | ❌ Fail                    | ❌ Fail before the upload          |
+
+<!-- markdownlint-enable MD013 MD060 -->
+
+<!-- markdownlint-enable MD013 -->
+
+A dry run with `release_tag` is the verification job of a release, so
+it fails for anything that would stop the release. A pull request's
+dry run between releases routinely finds different content under an
+unbumped version, which merits a warning but not a failure. Skipping
+an identical archive makes a re-run safe, such as one that retries
+the remaining crates of a workspace release after a partial failure.
+If an upload fails but the index then shows this exact archive, as
+after a timeout, the action reports it as skipped rather than failed.
 
 ### Credential handling
 
@@ -370,6 +403,7 @@ warnings, Cargo's own included. For example:
 | Release tag  | ✅ <code>v0.1.0</code> matches                                                |
 | Verification | ✅ Compiled and verified in this job                                          |
 | Package size | ✅ 6.8 KiB of the 10.0 MiB limit                                              |
+| crates.io    | ✅ Version not yet published                                                  |
 | SHA-256      | <code>3c8bdba0cee1a8887ae312331ca76aff760f3d4e82787aefd71ae848aee6176e</code> |
 
 <!-- markdownlint-enable MD013 MD060 -->
@@ -377,10 +411,11 @@ warnings, Cargo's own included. For example:
 
 <!-- markdownlint-enable MD013 MD033 -->
 
-Headlines distinguish 🚀 published, ✅ dry run passed, and ❌ failed
-at a named stage, with ⚠️ marking a failure that `permit_fail` let
-through. Checks the run never reached read "Not reached". A published
-crate links to its crates.io page. The summary never includes credentials.
+Headlines distinguish 🚀 published, ⛔️ skipped as already
+published, ✅ dry run passed, and ❌ failed at a named stage, with
+⚠️ marking a failure that `permit_fail` let through. Checks the run
+never reached read "Not reached". A published or skipped crate links
+to its crates.io page. The summary never includes credentials.
 
 ## Testing
 
@@ -388,12 +423,14 @@ crate links to its crates.io page. The summary never includes credentials.
 
 - Unit tests: [Bats](https://github.com/bats-core/bats-core) suites
   in `tests/` drive `scripts/publish-crate.sh` against stand-ins for
-  Cargo and rustup, covering each stage, input validation, credential
-  handling and the summary.
+  Cargo, rustup and the crates.io index, covering each stage, input
+  validation, credential handling and the summary.
 - Dry runs against a generated two-member workspace and against
   [test-rust-project](https://github.com/lfreleng-actions/test-rust-project).
 - Failure cases, which must fail closed.
-- Release safeguards against real rustup: a path-based toolchain.
+- Release safeguards against real rustup and the live crates.io
+  index: a path-based toolchain, and a version already published
+  with different content.
 
 Run the unit tests locally with Bats 1.7.0 or later:
 
