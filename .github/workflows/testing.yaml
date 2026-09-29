@@ -159,6 +159,7 @@ jobs:
           DIGEST_SHA256: ${{ steps.beta-digest.outputs.crate_sha256 }}
           BETA_PUBLISHED: ${{ steps.beta.outputs.published }}
           BETA_STATUS: ${{ steps.beta.outputs.publish_status }}
+          BETA_REGISTRY: ${{ steps.beta.outputs.registry_status }}
           BETA_CARGO: ${{ steps.beta.outputs.cargo_version }}
           ALPHA_NAME: ${{ steps.alpha.outputs.crate_name }}
           ALPHA_VERSION: ${{ steps.alpha.outputs.crate_version }}
@@ -176,6 +177,7 @@ jobs:
           check "beta crate_version" "$BETA_VERSION" 0.2.0
           check "beta published" "$BETA_PUBLISHED" false
           check "beta publish_status" "$BETA_STATUS" dry-run
+          check "beta registry_status" "$BETA_REGISTRY" absent
           if [[ ! "$BETA_CARGO" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
             echo "Unexpected beta cargo_version: '$BETA_CARGO' ❌"
             errors=1
@@ -450,9 +452,12 @@ jobs:
           echo "Failures correctly reported ✅"
           echo "Failures correctly reported ✅" >> "$GITHUB_STEP_SUMMARY"
 
-  ### Release safeguards, against real rustup ###
+  ### Release safeguards, against real rustup and the live index ###
   # A rust-toolchain file naming a path makes rustup run that directory's
-  # binaries as cargo, so the action must never upload with one.
+  # binaries as cargo, so the action must never upload with one. And an
+  # already-published version with different content must fail a release
+  # but only warn a plain dry run. 'itoa' 1.0.0 is real and published, so
+  # a local fixture with that name and version is guaranteed to differ.
   test-safeguards:
     name: "Test: release safeguards"
     runs-on: ubuntu-latest
@@ -480,8 +485,8 @@ jobs:
 
       # The path toolchain points at the runner's genuine stable
       # toolchain, so rustup resolves it and only the action's policy can
-      # stop it. The fixture is committed in a repository of its own,
-      # since Cargo refuses to package uncommitted files.
+      # stop it. Both fixtures are committed in repositories of their
+      # own, since Cargo refuses to package uncommitted files.
       - name: "Create fixtures"
         shell: bash
         run: |
@@ -510,6 +515,8 @@ jobs:
           printf '%s\n' '[toolchain]' "path = \"$toolchain_dir\"" \
             > path-toolchain/rust-toolchain.toml
           commit path-toolchain
+          make_crate taken itoa 1.0.0
+          commit taken
 
       - name: "Running local action: path toolchain, real publish"
         id: path-publish
@@ -534,6 +541,22 @@ jobs:
           path_prefix: path-toolchain
           dry_run: 'true'
 
+      - name: "Running local action: version taken, release verify"
+        id: taken-release
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: taken
+          release_tag: v1.0.0
+          dry_run: 'true'
+
+      - name: "Running local action: version taken, plain dry run"
+        id: taken-dry-run
+        uses: $/
+        with:
+          path_prefix: taken
+          dry_run: 'true'
+
       - name: "Verify safeguards"
         shell: bash
         env:
@@ -542,6 +565,13 @@ jobs:
           PATH_RELEASE: ${{ steps.path-release.outcome }}
           PATH_RELEASE_NAME: ${{ steps.path-release.outputs.crate_name }}
           PATH_DRY_RUN_STATUS: ${{ steps.path-dry-run.outputs.publish_status }}
+          TAKEN_RELEASE: ${{ steps.taken-release.outcome }}
+          # yamllint disable-line rule:line-length
+          TAKEN_RELEASE_REGISTRY: ${{ steps.taken-release.outputs.registry_status }}
+          # yamllint disable-line rule:line-length
+          TAKEN_DRY_RUN_REGISTRY: ${{ steps.taken-dry-run.outputs.registry_status }}
+          # yamllint disable-line rule:line-length
+          TAKEN_DRY_RUN_STATUS: ${{ steps.taken-dry-run.outputs.publish_status }}
         run: |
           # Verify safeguards
           errors=0
@@ -557,6 +587,12 @@ jobs:
           check "path toolchain publish crate_name" "$PATH_PUBLISH_NAME" ""
           check "path toolchain release crate_name" "$PATH_RELEASE_NAME" ""
           check "path toolchain dry run status" "$PATH_DRY_RUN_STATUS" dry-run
+          check "taken version release outcome" "$TAKEN_RELEASE" failure
+          check "taken version release registry_status" \
+            "$TAKEN_RELEASE_REGISTRY" different
+          check "taken version dry run registry_status" \
+            "$TAKEN_DRY_RUN_REGISTRY" different
+          check "taken version dry run status" "$TAKEN_DRY_RUN_STATUS" dry-run
           if [ "$errors" != 0 ]; then
             echo "Safeguard tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
             exit 1

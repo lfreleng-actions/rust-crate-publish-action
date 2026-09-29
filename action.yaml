@@ -76,12 +76,17 @@ outputs:
   cargo_version:
     description: "Cargo version that packaged the crate"
     value: ${{ steps.publish.outputs.cargo_version }}
+  registry_status:
+    # yamllint disable-line rule:line-length
+    description: "This version on crates.io: 'absent', 'identical' (same archive) or 'different'"
+    value: ${{ steps.publish.outputs.registry_status }}
   publish_status:
     # yamllint disable-line rule:line-length
-    description: "Outcome: 'published', 'dry-run' or 'failed'"
+    description: "Outcome: 'published', 'skipped' (identical already there), 'dry-run' or 'failed'"
     value: ${{ steps.publish.outputs.publish_status }}
   published:
-    description: "'true' when the crate reached crates.io, otherwise 'false'"
+    # yamllint disable-line rule:line-length
+    description: "'true' when this run uploaded the crate; 'false' for a skip too, see publish_status"
     value: ${{ steps.publish.outputs.published }}
 
 runs:

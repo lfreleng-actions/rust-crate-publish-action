@@ -3,8 +3,9 @@
 # SPDX-FileCopyrightText: 2026 Overture Maps
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Unit tests for scripts/publish-crate.sh, run against cargo and rustup
-# stand-ins (fixtures/). No network access, compilation or publishing.
+# Unit tests for scripts/publish-crate.sh, run against cargo, rustup and
+# curl stand-ins (fixtures/). No network access, compilation or
+# publishing.
 
 # Each @test runs in its own subshell and setup() resets the state, so
 # variables exported inside one test are meant to stay local to it.
@@ -22,7 +23,7 @@ setup() {
   mkdir -p "$workdir/bin" "$project" "$workdir/cargo home" \
     "$workdir/runner temp"
   local tool
-  for tool in cargo rustup; do
+  for tool in cargo rustup curl; do
     cp "$BATS_TEST_DIRNAME/fixtures/$tool.sh" "$workdir/bin/$tool"
     chmod +x "$workdir/bin/$tool"
   done
@@ -40,6 +41,7 @@ setup() {
   export MOCK_CARGO_ENV="$workdir/cargo env"
   export MOCK_CARGO_TARGETS="$workdir/cargo targets"
   export MOCK_RUSTUP_LOG="$workdir/rustup calls"
+  export MOCK_CURL_LOG="$workdir/curl calls"
   export MOCK_MANIFEST_JSON="$workdir/manifest.json"
   cp "$BATS_TEST_DIRNAME/fixtures/manifest.json" "$MOCK_MANIFEST_JSON"
   export MOCK_CRATE_SIZE=32
@@ -48,18 +50,21 @@ setup() {
   unset INPUT_EXPECTED_SHA256 CARGO_REGISTRY_CREDENTIAL_PROVIDER
   unset MOCK_FAIL_STAGE MOCK_MISSING_PACKAGE MOCK_TAMPER MOCK_TOOLCHAIN
   unset MOCK_INCLUDE_OTHER_PACKAGE MOCK_CARGO_WARNING MOCK_CARGO_VERSION
-  unset MOCK_RUSTUP_FAIL CARGO_TARGET_DIR
+  unset MOCK_RUSTUP_FAIL MOCK_CURL_FAIL MOCK_INDEX_STATUS MOCK_INDEX_BODY
+  unset MOCK_INDEX_STATUS_2 MOCK_INDEX_BODY_2 CARGO_TARGET_DIR
   unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
   unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
   unset GITHUB_REPOSITORY GITHUB_WORKFLOW_REF RUSTUP_TOOLCHAIN
   local file
   for file in "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY" "$MOCK_CARGO_LOG" \
-    "$MOCK_CARGO_ENV" "$MOCK_CARGO_TARGETS" "$MOCK_RUSTUP_LOG"; do
+    "$MOCK_CARGO_ENV" "$MOCK_CARGO_TARGETS" "$MOCK_RUSTUP_LOG" \
+    "$MOCK_CURL_LOG"; do
     : > "$file"
   done
 }
 
 run_action() {
+  : > "$MOCK_CURL_LOG"
   run "$BASH" "$script"
 }
 
@@ -100,6 +105,13 @@ zero_sha256() {
   fi
 }
 
+# Serve a crates.io index entry for VERSION with CKSUM.
+index_entry() {
+  printf '{"name":"example-crate","vers":"%s","cksum":"%s","yanked":%s}\n' \
+    "$1" "$2" "${3:-false}" > "$workdir/index.json"
+  export MOCK_INDEX_STATUS=200 MOCK_INDEX_BODY="$workdir/index.json"
+}
+
 readonly publish_calls=$'version\nmetadata\npackage\ndry-run\nrepackage\npublish'
 readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
 
@@ -112,8 +124,8 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   assert_calls "$publish_calls"
   [ "$(cat "$GITHUB_OUTPUT")" = "$(printf '%s\n' cargo_version=1.98.1 \
     crate_name=example-crate crate_version=1.2.3 crate_size_bytes=32 \
-    "crate_sha256=$(zero_sha256 32)" published=true \
-    publish_status=published)" ]
+    "crate_sha256=$(zero_sha256 32)" registry_status=absent \
+    published=true publish_status=published)" ]
   [[ "$output" == *"Published example-crate 1.2.3 to crates.io"* ]]
 }
 
@@ -653,6 +665,165 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   done
 }
 
+### crates.io version check ###
+
+@test "looks the crate up at its sparse index path" {
+  local name expected
+  for name in a ab abc Example-Crate; do
+    case "$name" in
+      a) expected=1/a ;;
+      ab) expected=2/ab ;;
+      abc) expected=3/a/abc ;;
+      Example-Crate) expected=ex/am/example-crate ;;
+    esac
+    printf '{"name":"%s","version":"1.2.3"}\n' "$name" > "$MOCK_MANIFEST_JSON"
+    export INPUT_DRY_RUN=true
+    run_action
+
+    [ "$status" -eq 0 ]
+    [ "$(head -1 "$MOCK_CURL_LOG")" = "https://index.crates.io/$expected" ]
+  done
+}
+
+@test "an identical published archive skips the upload" {
+  index_entry 1.2.3 "$(zero_sha256 32)"
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls $'version\nmetadata\npackage'
+  [ "$(output_value registry_status)" = identical ]
+  [ "$(output_value publish_status)" = skipped ]
+  [ "$(output_value published)" = false ]
+  grep -Fx '### ⛔️ Skipped: previously published: example-crate 1.2.3' \
+    "$GITHUB_STEP_SUMMARY"
+  grep -F '| Link | 🔗 https://crates.io/crates/example-crate/1.2.3 |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "an identical published archive lets a dry run complete" {
+  index_entry 1.2.3 "$(zero_sha256 32)"
+  export INPUT_DRY_RUN=true INPUT_RELEASE_TAG=v1.2.3
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls "$dry_run_calls"
+  [ "$(output_value registry_status)" = identical ]
+}
+
+@test "different published content fails a real publish before any upload" {
+  index_entry 1.2.3 "$(zero_sha256 99)"
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"already on crates.io with different content (published SHA-256 $(zero_sha256 99))"* ]]
+  assert_calls $'version\nmetadata\npackage'
+  [ "$(output_value registry_status)" = different ]
+  grep -F '| crates.io | ❌ Already published with different content |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "different published content fails a release verification dry run" {
+  index_entry 1.2.3 "$(zero_sha256 99)"
+  export INPUT_DRY_RUN=true INPUT_RELEASE_TAG=v1.2.3
+  run_action
+
+  [ "$status" -eq 1 ]
+  [ "$(output_value publish_status)" = failed ]
+}
+
+@test "different published content only warns a plain dry run" {
+  index_entry 1.2.3 "$(zero_sha256 99)"
+  export INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"::warning::example-crate 1.2.3 is already on crates.io with different content; bump the version"* ]]
+  assert_calls "$dry_run_calls"
+  grep -F '| crates.io | ⚠️ Already published with different content |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "ignores build metadata and other versions in the index" {
+  index_entry 1.2.3+build.7 "$(zero_sha256 32)"
+  run_action
+  [ "$status" -eq 0 ]
+  [ "$(output_value registry_status)" = identical ]
+
+  reset_logs
+  index_entry 1.2.2 "$(zero_sha256 99)"
+  run_action
+  [ "$status" -eq 0 ]
+  [ "$(output_value registry_status)" = absent ]
+  [ "$(output_value publish_status)" = published ]
+}
+
+@test "fails closed when the crates.io index cannot be read" {
+  local case
+  for case in unreachable http-500 bad-json no-cksum; do
+    unset MOCK_CURL_FAIL MOCK_INDEX_STATUS MOCK_INDEX_BODY
+    case "$case" in
+      unreachable) export MOCK_CURL_FAIL=true ;;
+      http-500) export MOCK_INDEX_STATUS=500 ;;
+      bad-json)
+        printf 'not json\n' > "$workdir/index.json"
+        export MOCK_INDEX_STATUS=200 MOCK_INDEX_BODY="$workdir/index.json"
+        ;;
+      no-cksum)
+        printf '{"name":"example-crate","vers":"1.2.3"}\n' > "$workdir/index.json"
+        export MOCK_INDEX_STATUS=200 MOCK_INDEX_BODY="$workdir/index.json"
+        ;;
+    esac
+    reset_logs
+    export INPUT_DRY_RUN=true
+    run_action
+
+    [ "$status" -eq 1 ]
+    grep -F '### ❌ Failed at Check crates.io' "$GITHUB_STEP_SUMMARY"
+  done
+}
+
+@test "a failed upload that crates.io nevertheless holds counts as skipped" {
+  printf '{"name":"example-crate","vers":"1.2.3","cksum":"%s"}\n' \
+    "$(zero_sha256 32)" > "$workdir/late.json"
+  export MOCK_FAIL_STAGE=publish MOCK_INDEX_STATUS_2=200 \
+    MOCK_INDEX_BODY_2="$workdir/late.json"
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$MOCK_CURL_LOG")" -eq 2 ]
+  [ "$(output_value publish_status | tail -1)" = skipped ]
+  [[ "$output" == *"crates.io already holds this exact archive"* ]]
+}
+
+@test "a failed upload crates.io does not hold keeps Cargo's exit code" {
+  export MOCK_FAIL_STAGE=publish
+  run_action
+
+  [ "$status" -eq 42 ]
+  [ "$(wc -l < "$MOCK_CURL_LOG")" -eq 2 ]
+}
+
+@test "a failed re-check after a failed upload still keeps Cargo's exit code" {
+  printf 'not json\n' > "$workdir/broken.json"
+  local case
+  for case in http-500 bad-json; do
+    unset MOCK_INDEX_STATUS_2 MOCK_INDEX_BODY_2
+    case "$case" in
+      http-500) export MOCK_INDEX_STATUS_2=500 ;;
+      bad-json) export MOCK_INDEX_STATUS_2=200 \
+        MOCK_INDEX_BODY_2="$workdir/broken.json" ;;
+    esac
+    reset_logs
+    export MOCK_FAIL_STAGE=publish
+    run_action
+
+    [ "$status" -eq 42 ]
+    [ "$(wc -l < "$MOCK_CURL_LOG")" -eq 2 ]
+    grep -Fx "Publish failed with exit status 42; see the step log for Cargo's output." \
+      "$GITHUB_STEP_SUMMARY"
+  done
+}
+
 ### permit_fail ###
 
 @test "permit_fail reports success for a failed stage, with a warning" {
@@ -855,6 +1026,7 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
 | Release tag | ✅ <code>v1.2.3</code> matches |
 | Verification | ✅ Compiled and verified in this job |
 | Package size | ✅ 32 B of the 10.0 MiB limit |
+| crates.io | ✅ Version not yet published |
 | SHA-256 | <code>$sha</code> |
 | Link | 🔗 https://crates.io/crates/example-crate/1.2.3 |
 MARKDOWN
