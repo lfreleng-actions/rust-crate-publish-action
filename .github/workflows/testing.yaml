@@ -93,12 +93,19 @@ jobs:
       # requested manifest rather than the first workspace member. Cargo
       # refuses to package files git reports as uncommitted, and these
       # sit untracked inside this checkout, so they get a repository of
-      # their own.
+      # their own. Crate names are unique to each run: nobody owns them on
+      # crates.io, so a fixed name could be published by anyone and
+      # break the release-intent checks below. The random part stops a
+      # predicted run ID being claimed in advance.
       - name: "Create workspace fixture"
+        id: fixture
         shell: bash
         run: |
           # Create workspace fixture
           set -euo pipefail
+          suffix="$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+          prefix="lfreleng-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
           mkdir -p fixture
           printf '%s\n' '[workspace]' 'members = ["crates/*"]' \
             'resolver = "2"' > fixture/Cargo.toml
@@ -108,7 +115,7 @@ jobs:
             dir="fixture/crates/$name"
             mkdir -p "$dir/src"
             printf '%s\n' '[package]' \
-              "name = \"lfreleng-publish-fixture-$name\"" \
+              "name = \"$prefix-$name\"" \
               "version = \"$version\"" 'edition = "2021"' \
               'description = "Fixture for rust-crate-publish-action"' \
               'license = "Apache-2.0"' > "$dir/Cargo.toml"
@@ -164,6 +171,7 @@ jobs:
           ALPHA_NAME: ${{ steps.alpha.outputs.crate_name }}
           ALPHA_VERSION: ${{ steps.alpha.outputs.crate_version }}
           ALPHA_PUBLISHED: ${{ steps.alpha.outputs.published }}
+          FIXTURE_PREFIX: ${{ steps.fixture.outputs.prefix }}
         run: |
           # Verify dry-run outputs
           errors=0
@@ -173,7 +181,7 @@ jobs:
               errors=1
             fi
           }
-          check "beta crate_name" "$BETA_NAME" lfreleng-publish-fixture-beta
+          check "beta crate_name" "$BETA_NAME" "$FIXTURE_PREFIX-beta"
           check "beta crate_version" "$BETA_VERSION" 0.2.0
           check "beta published" "$BETA_PUBLISHED" false
           check "beta publish_status" "$BETA_STATUS" dry-run
@@ -182,7 +190,7 @@ jobs:
             echo "Unexpected beta cargo_version: '$BETA_CARGO' ❌"
             errors=1
           fi
-          check "alpha crate_name" "$ALPHA_NAME" lfreleng-publish-fixture-alpha
+          check "alpha crate_name" "$ALPHA_NAME" "$FIXTURE_PREFIX-alpha"
           check "alpha crate_version" "$ALPHA_VERSION" 0.1.0
           check "alpha published" "$ALPHA_PUBLISHED" false
           if [[ ! "$BETA_SIZE" =~ ^[1-9][0-9]*$ ]]; then
@@ -236,6 +244,12 @@ jobs:
           path: "test-rust-project"
           persist-credentials: false
 
+      # No release_tag here: lfreleng-test-rust-project is meant to be on
+      # crates.io, and a dry run with release intent rightly fails when
+      # the published bytes differ, as they do whenever this runner's
+      # Cargo version does. Plain dry runs only warn, so this job holds
+      # whatever the registry says. The workspace fixture job covers
+      # release-tag matching on run-unique names.
       - name: "Running local action: dry run"
         id: dry-run
         uses: $/
@@ -243,14 +257,15 @@ jobs:
           path_prefix: test-rust-project
           dry_run: 'true'
 
-      # Feed the discovered version back in as a release tag, so the
-      # check passes whatever version the test project carries.
-      - name: "Running local action: dry run with matching release tag"
-        id: tagged
+      # The recommended two-job pattern, end to end against the shared
+      # fixture: the digest from the verifying run gates a run that
+      # compiles nothing.
+      - name: "Running local action: expected_sha256 from the dry run"
+        id: digest
         uses: $/
         with:
           path_prefix: test-rust-project
-          release_tag: "v${{ steps.dry-run.outputs.crate_version }}"
+          expected_sha256: ${{ steps.dry-run.outputs.crate_sha256 }}
           dry_run: 'true'
 
       - name: "Verify dry-run outputs"
@@ -259,8 +274,11 @@ jobs:
           CRATE_NAME: ${{ steps.dry-run.outputs.crate_name }}
           CRATE_VERSION: ${{ steps.dry-run.outputs.crate_version }}
           CRATE_SIZE: ${{ steps.dry-run.outputs.crate_size_bytes }}
-          PUBLISHED: ${{ steps.dry-run.outputs.published }}
-          TAGGED_PUBLISHED: ${{ steps.tagged.outputs.published }}
+          CRATE_SHA256: ${{ steps.dry-run.outputs.crate_sha256 }}
+          REGISTRY: ${{ steps.dry-run.outputs.registry_status }}
+          STATUS: ${{ steps.dry-run.outputs.publish_status }}
+          DIGEST_SHA256: ${{ steps.digest.outputs.crate_sha256 }}
+          DIGEST_STATUS: ${{ steps.digest.outputs.publish_status }}
         run: |
           # Verify dry-run outputs
           errors=0
@@ -272,16 +290,27 @@ jobs:
             echo "Unexpected crate_size_bytes: '$CRATE_SIZE' ❌"
             errors=1
           fi
-          if [ "$PUBLISHED" != false ] || [ "$TAGGED_PUBLISHED" != false ]; then
-            echo "A dry run reported a publish ❌"
+          case "$REGISTRY" in
+            absent | identical | different) ;;
+            *)
+              echo "Unexpected registry_status: '$REGISTRY' ❌"
+              errors=1
+              ;;
+          esac
+          if [ "$STATUS" != dry-run ] || [ "$DIGEST_STATUS" != dry-run ]; then
+            echo "A dry run reported '$STATUS'/'$DIGEST_STATUS' ❌"
+            errors=1
+          fi
+          if [ "$DIGEST_SHA256" != "$CRATE_SHA256" ]; then
+            echo "expected_sha256 run packaged a different archive ❌"
             errors=1
           fi
           if [ "$errors" != 0 ]; then
             echo "test-rust-project dry runs failed ❌" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          echo "Dry run verified: $CRATE_NAME $CRATE_VERSION ✅"
-          echo "Dry run verified: $CRATE_NAME $CRATE_VERSION ✅" \
+          echo "Dry runs verified: $CRATE_NAME $CRATE_VERSION ($REGISTRY) ✅"
+          echo "Dry runs verified: $CRATE_NAME $CRATE_VERSION ($REGISTRY) ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
   ### Invalid inputs and failed checks must fail closed ###
@@ -318,8 +347,11 @@ jobs:
         run: |
           # Create minimal crate fixture
           set -euo pipefail
+          # A run-unique name, as in the workspace fixture
+          suffix="$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+          name="lfreleng-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
           mkdir -p minimal/src
-          printf '%s\n' '[package]' 'name = "lfreleng-publish-fixture"' \
+          printf '%s\n' '[package]' "name = \"$name\"" \
             'version = "1.0.0"' 'edition = "2021"' \
             'description = "Fixture for rust-crate-publish-action"' \
             'license = "Apache-2.0"' > minimal/Cargo.toml
@@ -508,7 +540,10 @@ jobs:
             git -C "$1" -c user.name=CI -c user.email=ci@example.org \
               -c commit.gpgsign=false commit -q -m 'Fixture'
           }
-          make_crate path-toolchain lfreleng-publish-fixture 1.0.0
+          # A run-unique name, as in the workspace fixture
+          suffix="$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+          name="lfreleng-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+          make_crate path-toolchain "$name" 1.0.0
           active="$(rustup show active-toolchain | cut -d' ' -f1)"
           toolchain_dir="$(rustup show home)/toolchains/$active"
           test -x "$toolchain_dir/bin/cargo"
