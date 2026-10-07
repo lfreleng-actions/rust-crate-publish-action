@@ -3,8 +3,8 @@
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Static analysis of action.yaml and the workflows, using CodeQL's
-# GitHub Actions queries. The shell scripts are covered by ShellCheck
-# in pre-commit.
+# GitHub Actions queries, and of the JavaScript ESLint configuration.
+# The shell scripts are covered by ShellCheck in pre-commit.
 name: 'Security Scans (CodeQL)'
 
 # yamllint disable-line rule:truthy
@@ -34,6 +34,6 @@ jobs:
     # yamllint disable-line rule:line-length
     uses: lfreleng-actions/security-workflows/.github/workflows/codeql.yaml@76ea52302203912c2ced87702681da58b447d62e  # v0.9.0
     with:
-      languages: 'actions'
+      languages: 'actions,javascript-typescript'
       # yamllint disable-line rule:line-length
       harden_runner_allowlist: 'lfreleng-actions//.github/harden-runner/lfreleng-actions/allow_list.txt@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
