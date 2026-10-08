@@ -11,6 +11,13 @@
 set -euo pipefail
 
 manifest="$MOCK_EXPECT_MANIFEST"
+# MOCK_EXPECT_REGISTRY names the registry a test expects; unset means
+# crates.io, which packaging leaves implicit.
+package_registry=()
+if [ -n "${MOCK_EXPECT_REGISTRY:-}" ]; then
+  package_registry=(--registry "$MOCK_EXPECT_REGISTRY")
+fi
+publish_registry="${MOCK_EXPECT_REGISTRY:-crates-io}"
 case "${1:-}" in
   --version)
     stage=version
@@ -24,22 +31,25 @@ case "${1:-}" in
   package)
     if [ "${2:-}" = "--no-verify" ]; then
       stage=repackage
-      expected=(package --no-verify --locked --target-dir @TARGET
+      expected=(package --no-verify --locked
+        ${package_registry[@]+"${package_registry[@]}"} --target-dir @TARGET
         --manifest-path "$manifest")
     else
       stage=package
-      expected=(package --locked --target-dir @TARGET
+      expected=(package --locked
+        ${package_registry[@]+"${package_registry[@]}"} --target-dir @TARGET
         --manifest-path "$manifest")
     fi
     ;;
   publish)
     if [ "${2:-}" = "--dry-run" ]; then
       stage=dry-run
-      expected=(publish --dry-run --no-verify --locked --registry crates-io
-        --target-dir @TARGET --manifest-path "$manifest")
+      expected=(publish --dry-run --no-verify --locked
+        --registry "$publish_registry" --target-dir @TARGET
+        --manifest-path "$manifest")
     else
       stage=publish
-      expected=(publish --no-verify --locked --registry crates-io
+      expected=(publish --no-verify --locked --registry "$publish_registry"
         --target-dir @TARGET --manifest-path "$manifest")
     fi
     ;;
@@ -57,6 +67,15 @@ printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$stage" "$(pwd -P)" \
   "${INPUT_REGISTRY_TOKEN-unset}" \
   "${CARGO_REGISTRY_CREDENTIAL_PROVIDER-unset}" \
   "${RUSTUP_TOOLCHAIN-unset}" >> "$MOCK_CARGO_ENV"
+# Every registry, GitHub token or runner command file variable this
+# stage can see, as sorted NAME=value pairs, for the scrub tests. Runners
+# set other ACTIONS_* variables the action has no reason to withhold.
+{
+  printf '%s|' "$stage"
+  env | grep -E '^(CARGO_REGISTRY_[A-Z_]+|CARGO_REGISTRIES_[A-Z0-9_]+|ACTIONS_(ID_TOKEN_REQUEST_(TOKEN|URL)|RUNTIME_TOKEN)|GITHUB_(OUTPUT|ENV|PATH|STATE|STEP_SUMMARY))=' \
+    | LC_ALL=C sort | tr '\n' ' ' || true
+  echo
+} >> "$MOCK_CARGO_VARS"
 
 [ "$#" -eq "${#expected[@]}" ] || exit 91
 target=""
@@ -122,6 +141,9 @@ case "$stage" in
     fi
     ;;
   dry-run)
+    if [ -n "${MOCK_DRY_RUN_EXISTS:-}" ]; then
+      echo "warning: crate example-crate@1.2.3 already exists on $MOCK_DRY_RUN_EXISTS" >&2
+    fi
     echo "warning: aborting upload due to dry run" >&2
     ;;
 esac

@@ -313,6 +313,108 @@ jobs:
           echo "Dry runs verified: $CRATE_NAME $CRATE_VERSION ($REGISTRY) ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
+  ### Dry runs through a named registry ###
+  # The allow-list admits crates.io's hosts but not staging's, so the
+  # named registry here reads crates.io's own sparse index: it covers
+  # --registry, the index variable, config.json and the version check
+  # without new egress. Nothing here publishes.
+  test-named-registry:
+    name: "Test: dry run (named registry)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    env:
+      CARGO_REGISTRIES_INDEX_MIRROR_INDEX: "sparse+https://index.crates.io/"
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test project"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: "lfreleng-actions/test-rust-project"
+          ref: "5db6f8f6624e676d1d76f8db02a0253fee39900c"  # v0.0.1
+          path: "test-rust-project"
+          persist-credentials: false
+
+      - name: "Running local action: dry run to crates.io"
+        id: default
+        uses: $/
+        with:
+          path_prefix: test-rust-project
+          dry_run: 'true'
+
+      - name: "Running local action: dry run to a named registry"
+        id: named
+        uses: $/
+        with:
+          path_prefix: test-rust-project
+          registry: index-mirror
+          dry_run: 'true'
+
+      - name: "Running local action: registry 'crates-io'"
+        id: crates-io
+        uses: $/
+        with:
+          path_prefix: test-rust-project
+          registry: crates-io
+          dry_run: 'true'
+
+      - name: "Verify named registry outputs"
+        shell: bash
+        env:
+          DEFAULT_SHA256: ${{ steps.default.outputs.crate_sha256 }}
+          DEFAULT_REGISTRY: ${{ steps.default.outputs.registry_status }}
+          NAMED_SHA256: ${{ steps.named.outputs.crate_sha256 }}
+          NAMED_REGISTRY: ${{ steps.named.outputs.registry_status }}
+          NAMED_STATUS: ${{ steps.named.outputs.publish_status }}
+          ALIAS_SHA256: ${{ steps.crates-io.outputs.crate_sha256 }}
+          ALIAS_REGISTRY: ${{ steps.crates-io.outputs.registry_status }}
+        run: |
+          # Verify named registry outputs
+          errors=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "Unexpected $1: '$2' (expected '$3') ❌"
+              errors=1
+            fi
+          }
+          if [[ ! "$DEFAULT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Missing crate_sha256 from the crates.io dry run ❌"
+            errors=1
+          fi
+          # The same index, read as a named registry, gives the same
+          # verdict on the same archive.
+          check "named crate_sha256" "$NAMED_SHA256" "$DEFAULT_SHA256"
+          check "named registry_status" "$NAMED_REGISTRY" "$DEFAULT_REGISTRY"
+          check "named publish_status" "$NAMED_STATUS" dry-run
+          check "crates-io crate_sha256" "$ALIAS_SHA256" "$DEFAULT_SHA256"
+          check "crates-io registry_status" "$ALIAS_REGISTRY" \
+            "$DEFAULT_REGISTRY"
+          if [ "$errors" != 0 ]; then
+            echo "Named registry dry runs failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Named registry dry runs verified ($NAMED_REGISTRY) ✅"
+          echo "Named registry dry runs verified ($NAMED_REGISTRY) ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
   ### Invalid inputs and failed checks must fail closed ###
   # Every case fails before the crates.io lookup, so this job needs no
   # crates.io access.
@@ -434,6 +536,36 @@ jobs:
           dry_run: 'true'
           permit_fail: 'true'
 
+      - name: "Running local action: registry without an index URL"
+        id: registry-no-index
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: minimal
+          registry: no-index-set
+          dry_run: 'true'
+
+      - name: "Running local action: registry name injection"
+        id: registry-injection
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: minimal
+          registry: 'staging; touch injected'
+          dry_run: 'true'
+
+      - name: "Running local action: registry with a git index"
+        id: registry-git-index
+        continue-on-error: true
+        env:
+          # yamllint disable-line rule:line-length
+          CARGO_REGISTRIES_GIT_INDEX_INDEX: "https://github.com/rust-lang/staging.crates.io-index"
+        uses: $/
+        with:
+          path_prefix: minimal
+          registry: git-index
+          dry_run: 'true'
+
       - name: "Verify failures were reported"
         shell: bash
         env:
@@ -447,6 +579,9 @@ jobs:
           DIGEST_OUTCOME: ${{ steps.digest-mismatch.outcome }}
           PERMITTED_OUTCOME: ${{ steps.permitted.outcome }}
           PERMITTED_PUBLISHED: ${{ steps.permitted.outputs.published }}
+          REGISTRY_NO_INDEX: ${{ steps.registry-no-index.outcome }}
+          REGISTRY_INJECTION: ${{ steps.registry-injection.outcome }}
+          REGISTRY_GIT_INDEX: ${{ steps.registry-git-index.outcome }}
         run: |
           # Failure testing is also important; each case MUST fail
           errors=0
@@ -456,7 +591,10 @@ jobs:
             "release_tag injection:$TAG_OUTCOME" \
             "release_tag mismatch:$MISMATCH_OUTCOME" \
             "max_crate_size_bytes:$OVERSIZE_OUTCOME" \
-            "expected_sha256:$DIGEST_OUTCOME"; do
+            "expected_sha256:$DIGEST_OUTCOME" \
+            "registry without an index:$REGISTRY_NO_INDEX" \
+            "registry injection:$REGISTRY_INJECTION" \
+            "registry git index:$REGISTRY_GIT_INDEX"; do
             if [ "${pair##*:}" != failure ]; then
               echo "Case '${pair%:*}' did not fail (${pair##*:}) ❌"
               errors=1
