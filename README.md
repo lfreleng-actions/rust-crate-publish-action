@@ -15,6 +15,9 @@ Packages a Rust crate, checks its size against the crates.io upload cap,
 verifies its version against a release tag, and publishes it to
 crates.io.
 
+This action builds on John McCall's `publish-crate-to-crates-io` action
+for Overture Maps; see [Acknowledgements](#acknowledgements).
+
 ## rust-crate-publish-action
 
 The action publishes one crate per call. It targets crates.io and
@@ -438,12 +441,32 @@ Run the unit tests locally with Bats 1.7.0 or later:
 bats tests/
 ```
 
+## Acknowledgements
+
+This action began as the `publish-crate-to-crates-io` composite action
+that [John McCall](https://github.com/lowlydba) wrote for Overture Maps,
+and contributed to `OvertureMaps/workflows` in
+[pull request #105](https://github.com/OvertureMaps/workflows/pull/105).
+The Linux Foundation imported it at commit
+[`2ba5afb`](https://github.com/OvertureMaps/workflows/tree/2ba5afb48f6cff2989cc52e6cf93fef509cc3e76/.github/actions/publish-crate-to-crates-io)
+without its history, which lives in that monorepo.
+
+The original design shapes this action still: its inputs and
+outputs, the staged checks that each report their failing stage, the
+`cargo metadata` lookup that selects a workspace member by manifest
+path, the release tag comparison, the size limit, the job summary
+table, the Trusted Publishing notice, and the Bats suite with its
+mocked Cargo. Our thanks to John for that work.
+
+The [`NOTICE`](NOTICE) file records this origin alongside the copyright
+notice.
+
 ## Licensing
 
-This action derives from the `publish-crate-to-crates-io` action in
-[OvertureMaps/workflows](https://github.com/OvertureMaps/workflows/tree/2ba5afb48f6cff2989cc52e6cf93fef509cc3e76/.github/actions/publish-crate-to-crates-io),
-copyright 2026 Overture Maps and released under the MIT License. It
-remains under that licence alone:
+This action derives from the `publish-crate-to-crates-io` action
+described in [Acknowledgements](#acknowledgements), copyright 2026
+Overture Maps and released under the MIT License. It remains under
+that licence alone:
 
 - `action.yaml`, `scripts/`, the tests and fixtures derived from the
   original, and this README name MIT as their licence in their SPDX
@@ -451,7 +474,8 @@ remains under that licence alone:
   Linux Foundation releases its modifications under the same MIT
   terms.
 - `LICENSE` and `LICENSES/MIT.txt` reproduce the upstream licence
-  verbatim, copyright notice included.
+  verbatim, copyright notice included, and `NOTICE` records where
+  the original came from and who wrote it.
 - Files that did not come from the original, such as the repository
   scaffolding from the `lfreleng-actions` template, name Apache-2.0
   in their SPDX headers, with the text in `LICENSES/Apache-2.0.txt`.

@@ -1,0 +1,22 @@
+SPDX-License-Identifier: Apache-2.0
+SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+rust-crate-publish-action
+
+This action derives from the publish-crate-to-crates-io GitHub
+Action, written by John McCall (https://github.com/lowlydba) for
+Overture Maps and contributed to OvertureMaps/workflows in pull
+request #105:
+
+  https://github.com/OvertureMaps/workflows/pull/105
+
+The Linux Foundation imported it from OvertureMaps/workflows at
+commit 2ba5afb48f6cff2989cc52e6cf93fef509cc3e76:
+
+  https://github.com/OvertureMaps/workflows/tree/2ba5afb48f6cff2989cc52e6cf93fef509cc3e76/.github/actions/publish-crate-to-crates-io
+
+The original work is Copyright (c) 2026 Overture Maps and licensed
+under the MIT License. LICENSE and LICENSES/MIT.txt reproduce that
+licence and its copyright notice in full. Files derived from the
+original name Overture Maps as a copyright holder in their SPDX
+headers, or in REUSE.toml where the file format admits no comments.
