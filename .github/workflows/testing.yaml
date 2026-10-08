@@ -210,6 +210,177 @@ jobs:
           echo "Workspace fixture dry runs verified ✅"
           echo "Workspace fixture dry runs verified ✅" >> "$GITHUB_STEP_SUMMARY"
 
+  ### Dry runs publishing a workspace as one set ###
+  test-workspace-set:
+    name: "Test: dry run (workspace set)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # core <- util <- app depend on each other by version, and none is
+      # on crates.io, so only packaging them as one set can work;
+      # internal sets publish = false and must be left out. Run-unique
+      # names and a nested repository, as for the fixture above.
+      - name: "Create workspace set fixture"
+        id: fixture
+        shell: bash
+        run: |
+          # Create workspace set fixture
+          set -euo pipefail
+          suffix="$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+          prefix="lfreleng-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          mkdir -p set
+          printf '%s\n' '[workspace]' 'members = ["crates/*"]' \
+            'resolver = "2"' '[workspace.package]' 'version = "0.3.0"' \
+            'edition = "2021"' 'license = "Apache-2.0"' \
+            'description = "Fixture for rust-crate-publish-action"' \
+            > set/Cargo.toml
+          member() {
+            local dir="set/crates/$1"
+            mkdir -p "$dir/src"
+            printf '%s\n' '[package]' "name = \"$prefix-$1\"" \
+              'version.workspace = true' 'edition.workspace = true' \
+              'license.workspace = true' 'description.workspace = true' \
+              "$2" '[dependencies]' > "$dir/Cargo.toml"
+            if [ -n "$3" ]; then
+              printf '%s = { path = "../%s", version = "0.3.0" }\n' \
+                "$prefix-$3" "$3" >> "$dir/Cargo.toml"
+            fi
+            printf '%s\n' 'pub fn fixture() -> u8 { 1 }' > "$dir/src/lib.rs"
+          }
+          member core '' ''
+          member util '' core
+          member app '' util
+          member internal 'publish = false' core
+          printf '%s\n' '/target' > set/.gitignore
+          cargo generate-lockfile --offline --manifest-path set/Cargo.toml
+          git -C set init -q
+          git -C set add -A
+          git -C set -c user.name=CI -c user.email=ci@example.org \
+            -c commit.gpgsign=false commit -q -m 'Fixture'
+
+      - name: "Running local action: workspace set, release verification"
+        id: set
+        uses: $/
+        with:
+          path_prefix: set
+          workspace: 'true'
+          release_tag: v0.3.0
+          dry_run: 'true'
+
+      # The two-job pattern for a set: the digest map from the verified
+      # run makes this one package without compiling.
+      - name: "Running local action: expected_sha256 map from that run"
+        id: set-digest
+        uses: $/
+        with:
+          path_prefix: set
+          workspace: 'true'
+          expected_sha256: ${{ steps.set.outputs.crate_sha256 }}
+          dry_run: 'true'
+
+      - name: "Running local action: packages naming one crate"
+        id: core
+        uses: $/
+        with:
+          path_prefix: set
+          packages: ${{ steps.fixture.outputs.prefix }}-core
+          dry_run: 'true'
+
+      - name: "Running local action: one digest for several crates"
+        id: single-digest
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: set
+          workspace: 'true'
+          expected_sha256: ${{ steps.core.outputs.crate_sha256 }}
+          dry_run: 'true'
+
+      - name: "Running local action: packages naming a publish = false crate"
+        id: unpublishable
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: set
+          packages: ${{ steps.fixture.outputs.prefix }}-internal
+          dry_run: 'true'
+
+      - name: "Verify workspace set outputs"
+        shell: bash
+        env:
+          PREFIX: ${{ steps.fixture.outputs.prefix }}
+          SET_NAME: ${{ steps.set.outputs.crate_name }}
+          SET_VERSION: ${{ steps.set.outputs.crate_version }}
+          SET_SIZE: ${{ steps.set.outputs.crate_size_bytes }}
+          SET_SHA256: ${{ steps.set.outputs.crate_sha256 }}
+          SET_REGISTRY: ${{ steps.set.outputs.registry_status }}
+          SET_STATUS: ${{ steps.set.outputs.publish_status }}
+          SET_PUBLISHED: ${{ steps.set.outputs.published }}
+          DIGEST_SHA256: ${{ steps.set-digest.outputs.crate_sha256 }}
+          CORE_NAME: ${{ steps.core.outputs.crate_name }}
+          CORE_SHA256: ${{ steps.core.outputs.crate_sha256 }}
+          SINGLE_DIGEST_OUTCOME: ${{ steps.single-digest.outcome }}
+          UNPUBLISHABLE_OUTCOME: ${{ steps.unpublishable.outcome }}
+        run: |
+          # Verify workspace set outputs
+          errors=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "Unexpected $1: '$2' (expected '$3') ❌"
+              errors=1
+            fi
+          }
+          names=("$PREFIX-core" "$PREFIX-util" "$PREFIX-app")
+          keys="$(printf '%s\n' "${names[@]}" | jq -Rsc 'split("\n")[:-1]')"
+          j() { jq -c "$1" <<< "$2"; }
+          check "crate_name" "$SET_NAME" "${names[*]}"
+          check "crate_version" \
+            "$(j '[.[] | select(. == "0.3.0")] | length' "$SET_VERSION")" 3
+          check "crate_sha256 keys" "$(j 'keys_unsorted' "$SET_SHA256")" "$keys"
+          check "crate_sha256 values" \
+            "$(j '[.[] | test("^[0-9a-f]{64}$")] | all' "$SET_SHA256")" true
+          check "crate_size_bytes" \
+            "$(j '[.[] | numbers | select(. > 0)] | length' "$SET_SIZE")" 3
+          check "registry_status" \
+            "$(j '[.[] | select(. == "absent")] | length' "$SET_REGISTRY")" 3
+          check "publish_status" "$SET_STATUS" dry-run
+          check "published" "$SET_PUBLISHED" false
+          check "expected_sha256 run crate_sha256" \
+            "$DIGEST_SHA256" "$SET_SHA256"
+          check "single crate_name" "$CORE_NAME" "$PREFIX-core"
+          # Packaged alone or within the set, core is the same archive.
+          check "single crate_sha256" "$CORE_SHA256" \
+            "$(jq -r --arg n "$PREFIX-core" '.[$n]' <<< "$SET_SHA256")"
+          check "single digest for a set" "$SINGLE_DIGEST_OUTCOME" failure
+          check "publish = false package" "$UNPUBLISHABLE_OUTCOME" failure
+          if [ "$errors" != 0 ]; then
+            echo "Workspace set tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Workspace set dry runs verified ✅"
+          echo "Workspace set dry runs verified ✅" >> "$GITHUB_STEP_SUMMARY"
+
   ### Dry run against the shared test project ###
   test-rust-project:
     name: "Test: dry run (test-rust-project)"

@@ -3,8 +3,9 @@
 # SPDX-FileCopyrightText: 2026 Overture Maps
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Check, package, size-check and publish one crate to crates.io, or to
-# the Cargo registry the 'registry' input names.
+# Check, package, size-check and publish one crate, or a selection of
+# workspace members, to crates.io or to the Cargo registry the
+# 'registry' input names.
 #
 # Inputs arrive as INPUT_* environment variables (see action.yaml).
 # Stages run in order, and the first failure stops the run:
@@ -30,9 +31,14 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=job-summary.sh
 source "$script_dir/job-summary.sh"
+# shellcheck source=workspace.sh
+source "$script_dir/workspace.sh"
 
 path_prefix="${INPUT_PATH_PREFIX:-.}"
 manifest_path="${INPUT_MANIFEST_PATH:-Cargo.toml}"
+workspace_flag="${INPUT_WORKSPACE:-false}"
+packages_input="${INPUT_PACKAGES:-}"
+exclude_input="${INPUT_EXCLUDE:-}"
 release_tag="${INPUT_RELEASE_TAG:-}"
 max_bytes="${INPUT_MAX_CRATE_SIZE_BYTES:-10485760}"
 dry_run="${INPUT_DRY_RUN:-false}"
@@ -106,7 +112,9 @@ write_output() {
 
 render_summary() {
   local status="$1" outcome="" subject="" link=""
-  if [ -n "$crate_name" ] && [ -n "$crate_version" ]; then
+  if [ "$set_mode" = "true" ]; then
+    subject=": ${#set_names[@]} crates"
+  elif [ -n "$crate_name" ] && [ -n "$crate_version" ]; then
     subject=": $(summary_cell "$crate_name $crate_version")"
     if [ -z "$registry" ]; then
       link="https://crates.io/crates/$crate_name/$crate_version"
@@ -144,6 +152,14 @@ render_summary() {
   esac
   summary_row "Release tag" "$tag_cell"
   summary_row "Verification" "$verification_cell"
+  if [ "$set_mode" = "true" ]; then
+    if [ -n "$set_skipped" ]; then
+      summary_row "Not publishable" "$(summary_cell "$set_skipped")"
+    fi
+    set_summary_rows
+    write_summary "$outcome" "$failure_reason"
+    return 0
+  fi
   summary_row "Package size" "$size_cell"
   summary_row "$(summary_cell "$registry_label")" "$registry_cell"
   if [ -n "$crate_sha256" ]; then
@@ -465,6 +481,32 @@ describe_trusted_publisher() {
 require_boolean dry_run "$dry_run"
 require_boolean permit_fail "$permit_fail"
 require_boolean summary "$summary"
+require_boolean workspace "$workspace_flag"
+
+split_words "$packages_input"
+packages=(${words[@]+"${words[@]}"})
+split_words "$exclude_input"
+excludes=(${words[@]+"${words[@]}"})
+for word in ${packages[@]+"${packages[@]}"}; do
+  [[ "$word" =~ ^[A-Za-z0-9_-]+$ ]] || fail "packages must list crate names"
+done
+for word in ${excludes[@]+"${excludes[@]}"}; do
+  [[ "$word" =~ ^[A-Za-z0-9_-]+$ ]] || fail "exclude must list crate names"
+done
+# A non-empty packages replaces workspace, as in the other Rust
+# actions; exclude only narrows workspace.
+if [ "${#excludes[@]}" -gt 0 ] && [ "${#packages[@]}" -gt 0 ]; then
+  fail "exclude cannot be combined with packages"
+fi
+if [ "${#excludes[@]}" -gt 0 ] && [ "$workspace_flag" != "true" ]; then
+  fail "exclude needs workspace set to 'true'"
+fi
+selection_mode="manifest"
+if [ "${#packages[@]}" -gt 0 ]; then
+  selection_mode="packages"
+elif [ "$workspace_flag" = "true" ]; then
+  selection_mode="workspace"
+fi
 
 # Eighteen digits keeps the value inside a 64-bit shell integer.
 if [[ ! "$max_bytes" =~ ^[1-9][0-9]{0,17}$ ]]; then
@@ -475,7 +517,17 @@ if [ -n "$release_tag" ] && [[ ! "$release_tag" =~ ^[0-9A-Za-z._+-]+$ ]]; then
   fail "release_tag may contain only: 0-9 A-Z a-z . _ + -"
 fi
 
-if [ -n "$expected_sha256" ] \
+if expected_is_map; then
+  # Parsing the map needs jq, before the tool checks below run.
+  if ! command -v jq > /dev/null 2>&1; then
+    fail "required tool not found on PATH: jq"
+  fi
+  if ! expected_sha256="$(parse_digest_map)"; then
+    expected_sha256=""
+    fail "expected_sha256 must be one digest, or a JSON object mapping" \
+      "each crate name to 64 lowercase hexadecimal characters"
+  fi
+elif [ -n "$expected_sha256" ] \
   && [[ ! "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]; then
   fail "expected_sha256 must be 64 lowercase hexadecimal characters"
 fi
@@ -672,6 +724,24 @@ echo "Toolchain: ${toolchain:-cargo on PATH} (cargo $cargo_version)"
 stage="Read crate metadata"
 metadata="$(trusted_cargo metadata --no-deps --locked --format-version 1 \
   --manifest-path "$manifest_abs")"
+# workspace or packages select crates from the workspace. A selection of
+# one continues below as that member's manifest, exactly as if
+# manifest_path had named it; several are published as a set.
+if [ "$selection_mode" != "manifest" ]; then
+  select_crates "$selection_mode"
+  if expected_is_map; then
+    require_digest_keys "${set_names[@]}"
+  elif [ -n "$expected_sha256" ] && [ "${#set_names[@]}" -gt 1 ]; then
+    fail "expected_sha256 holds one digest, but ${#set_names[@]} crates" \
+      "are selected; pass the verifying run's crate_sha256 JSON object"
+  fi
+  if [ "${#set_names[@]}" -gt 1 ]; then
+    publish_crate_set
+    exit 0
+  fi
+  manifest_abs="${set_manifests[0]}"
+  manifest_display="${manifest_abs#"$workspace_real"/}"
+fi
 # A workspace lists every member: select the requested manifest.
 crate_name="$(jq -er --arg manifest "$manifest_abs" \
   '.packages[] | select(.manifest_path == $manifest) | .name
@@ -692,6 +762,10 @@ fi
 write_output crate_name "$crate_name"
 write_output crate_version "$crate_version"
 echo "Crate: $crate_name $crate_version"
+if expected_is_map; then
+  require_digest_keys "$crate_name"
+  expected_sha256="$(jq -r --arg n "$crate_name" '.[$n]' <<< "$expected_sha256")"
+fi
 
 ### Verify release tag ###
 
