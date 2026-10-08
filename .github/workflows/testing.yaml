@@ -326,6 +326,17 @@ jobs:
           packages: ${{ steps.fixture.outputs.prefix }}-internal
           dry_run: 'true'
 
+      # semver_checks checks each crate of a set on its own. None of
+      # these is on crates.io, so each one skips as a first release.
+      - name: "Running local action: semver checks on the set"
+        id: set-semver
+        uses: $/
+        with:
+          path_prefix: set
+          workspace: 'true'
+          dry_run: 'true'
+          semver_checks: 'true'
+
       - name: "Verify workspace set outputs"
         shell: bash
         env:
@@ -342,6 +353,9 @@ jobs:
           CORE_SHA256: ${{ steps.core.outputs.crate_sha256 }}
           SINGLE_DIGEST_OUTCOME: ${{ steps.single-digest.outcome }}
           UNPUBLISHABLE_OUTCOME: ${{ steps.unpublishable.outcome }}
+          SEMVER_STATUS: ${{ steps.set-semver.outputs.semver_status }}
+          SEMVER_BASELINE: ${{ steps.set-semver.outputs.semver_baseline }}
+          SEMVER_PUBLISH: ${{ steps.set-semver.outputs.publish_status }}
         run: |
           # Verify workspace set outputs
           errors=0
@@ -374,6 +388,12 @@ jobs:
             "$(jq -r --arg n "$PREFIX-core" '.[$n]' <<< "$SET_SHA256")"
           check "single digest for a set" "$SINGLE_DIGEST_OUTCOME" failure
           check "publish = false package" "$UNPUBLISHABLE_OUTCOME" failure
+          check "semver_status keys" "$(j 'keys_unsorted' "$SEMVER_STATUS")" \
+            "$keys"
+          check "semver_status" \
+            "$(j '[.[] | select(. == "skipped")] | length' "$SEMVER_STATUS")" 3
+          check "semver_baseline" "$SEMVER_BASELINE" ""
+          check "semver run publish_status" "$SEMVER_PUBLISH" dry-run
           if [ "$errors" != 0 ]; then
             echo "Workspace set tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
             exit 1
@@ -584,6 +604,150 @@ jobs:
           fi
           echo "Named registry dry runs verified ($NAMED_REGISTRY) ✅"
           echo "Named registry dry runs verified ($NAMED_REGISTRY) ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Semver checks against the published test-rust-project ###
+  # lfreleng-test-rust-project 0.1.0 is on crates.io, published from a
+  # later commit than this pin, so the archives differ and each check
+  # really compares this checkout with the published 0.1.0.
+  test-semver-checks:
+    name: "Test: semver checks (test-rust-project)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test project"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: "lfreleng-actions/test-rust-project"
+          ref: "5db6f8f6624e676d1d76f8db02a0253fee39900c"  # v0.0.1
+          path: "test-rust-project"
+          persist-credentials: false
+
+      - name: "Running local action: compatible API"
+        id: compatible
+        uses: $/
+        with:
+          path_prefix: test-rust-project
+          dry_run: 'true'
+          semver_checks: 'true'
+
+      # The publishing half of the two-job pattern must refuse it.
+      - name: "Running local action: refused with expected_sha256"
+        id: refused
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: test-rust-project
+          dry_run: 'true'
+          expected_sha256: ${{ steps.compatible.outputs.crate_sha256 }}
+          semver_checks: 'true'
+
+      # cargo-semver-checks takes its baseline from crates.io alone.
+      - name: "Running local action: refused for a named registry"
+        id: refused-registry
+        continue-on-error: true
+        uses: $/
+        env:
+          CARGO_REGISTRIES_INDEX_MIRROR_INDEX: "sparse+https://index.crates.io/"
+        with:
+          path_prefix: test-rust-project
+          registry: index-mirror
+          dry_run: 'true'
+          semver_checks: 'true'
+
+      # A parameter added to a public function: a major change that
+      # 0.1.0 does not allow. The binary does not call it, so the crate
+      # still packages. Cargo packages committed files only.
+      - name: "Break the public API"
+        shell: bash
+        working-directory: test-rust-project
+        run: |
+          # Break the public API
+          old='pub fn checked_sum(a: u64, b: u64)'
+          new='pub fn checked_sum(a: u64, b: u64, _c: u64)'
+          sed -i "s/^$old/$new/" src/lib.rs
+          git diff --exit-code --quiet src/lib.rs && exit 1
+          git -c user.name=ci -c user.email=ci@example.invalid \
+            commit -q -m "Break the public API" src/lib.rs
+
+      - name: "Running local action: breaking change"
+        id: breaking
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: test-rust-project
+          dry_run: 'true'
+          semver_checks: 'true'
+
+      - name: "Verify semver check outcomes"
+        shell: bash
+        env:
+          COMPATIBLE_STATUS: ${{ steps.compatible.outputs.semver_status }}
+          COMPATIBLE_BASELINE: ${{ steps.compatible.outputs.semver_baseline }}
+          REGISTRY: ${{ steps.compatible.outputs.registry_status }}
+          REFUSED: ${{ steps.refused.outcome }}
+          REFUSED_STATUS: ${{ steps.refused.outputs.semver_status }}
+          REGISTRY_REFUSED: ${{ steps.refused-registry.outcome }}
+          # yamllint disable-line rule:line-length
+          REGISTRY_REFUSED_STATUS: ${{ steps.refused-registry.outputs.semver_status }}
+          BREAKING: ${{ steps.breaking.outcome }}
+          BREAKING_STATUS: ${{ steps.breaking.outputs.semver_status }}
+          BREAKING_BASELINE: ${{ steps.breaking.outputs.semver_baseline }}
+        run: |
+          # Verify semver check outcomes
+          errors=0
+          if [ "$REGISTRY" != different ]; then
+            echo "Expected different bytes on crates.io, got '$REGISTRY' ❌"
+            errors=1
+          fi
+          if [ "$COMPATIBLE_STATUS" != passed ] \
+            || [ "$COMPATIBLE_BASELINE" != 0.1.0 ]; then
+            echo "Compatible API: '$COMPATIBLE_STATUS'" \
+              "vs '$COMPATIBLE_BASELINE' ❌"
+            errors=1
+          fi
+          if [ "$REFUSED" != failure ] || [ -n "$REFUSED_STATUS" ]; then
+            echo "expected_sha256 run: '$REFUSED', '$REFUSED_STATUS' ❌"
+            errors=1
+          fi
+          if [ "$REGISTRY_REFUSED" != failure ] \
+            || [ -n "$REGISTRY_REFUSED_STATUS" ]; then
+            echo "Named registry run: '$REGISTRY_REFUSED'" \
+              "'$REGISTRY_REFUSED_STATUS' ❌"
+            errors=1
+          fi
+          if [ "$BREAKING" != failure ] || [ "$BREAKING_STATUS" != failed ] \
+            || [ "$BREAKING_BASELINE" != 0.1.0 ]; then
+            echo "Breaking change: '$BREAKING', '$BREAKING_STATUS'" \
+              "vs '$BREAKING_BASELINE' ❌"
+            errors=1
+          fi
+          if [ "$errors" != 0 ]; then
+            echo "Semver checks failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Semver checks verified against crates.io 0.1.0 ✅"
+          echo "Semver checks verified against crates.io 0.1.0 ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
   ### Invalid inputs and failed checks must fail closed ###
