@@ -3,7 +3,8 @@
 # SPDX-FileCopyrightText: 2026 Overture Maps
 # SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# Check, package, size-check and publish one crate to crates.io.
+# Check, package, size-check and publish one crate to crates.io, or to
+# the Cargo registry the 'registry' input names.
 #
 # Inputs arrive as INPUT_* environment variables (see action.yaml).
 # Stages run in order, and the first failure stops the run:
@@ -12,6 +13,9 @@
 #   -> Verify release tag -> Package -> Check package size
 #   -> Match verified digest -> Check crates.io -> Dry-run publish
 #   -> Confirm package unchanged -> Publish
+#
+# A named registry adds 'Read registry config' after the workspace is
+# prepared, and checks that registry in place of crates.io.
 #
 # The compiling 'Package' stage runs in the project directory, so the
 # project's Cargo configuration and toolchain apply to the build. Every
@@ -36,6 +40,7 @@ permit_fail="${INPUT_PERMIT_FAIL:-false}"
 summary="${INPUT_SUMMARY:-true}"
 expected_sha256="${INPUT_EXPECTED_SHA256:-}"
 registry_token="${INPUT_REGISTRY_TOKEN:-}"
+registry="${INPUT_REGISTRY:-}"
 # Keep the token out of the environment Cargo and its children inherit.
 # This does not hide it from same-user processes that read an
 # ancestor's /proc/<pid>/environ; see expected_sha256 for isolation.
@@ -43,6 +48,18 @@ unset INPUT_REGISTRY_TOKEN
 
 readonly index_url="https://index.crates.io"
 readonly user_agent="rust-crate-publish-action (https://github.com/lfreleng-actions/rust-crate-publish-action)"
+
+# The target registry: crates.io unless 'Check inputs' finds a named
+# one. The upload gets the token through the first token variable and
+# keeps all of them; every other child loses them all.
+registry_label="crates.io"
+index_base="$index_url"
+publish_registry="crates-io"
+package_registry=()
+upload_token_vars=(CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN)
+upload_provider_vars=(CARGO_REGISTRY_CREDENTIAL_PROVIDER
+  CARGO_REGISTRIES_CRATES_IO_CREDENTIAL_PROVIDER)
+replace_note="crates.io never replaces a version: release a new one."
 
 crate_name=""
 crate_version=""
@@ -91,7 +108,9 @@ render_summary() {
   local status="$1" outcome="" subject="" link=""
   if [ -n "$crate_name" ] && [ -n "$crate_version" ]; then
     subject=": $(summary_cell "$crate_name $crate_version")"
-    link="https://crates.io/crates/$crate_name/$crate_version"
+    if [ -z "$registry" ]; then
+      link="https://crates.io/crates/$crate_name/$crate_version"
+    fi
   fi
   if [ "$status" -ne 0 ]; then
     if [ "$failures_permitted" = "true" ]; then
@@ -110,7 +129,7 @@ render_summary() {
   if [ "$dry_run" = "true" ]; then
     summary_row "Mode" "Dry run: nothing uploaded"
   else
-    summary_row "Mode" "Publish to crates.io"
+    summary_row "Mode" "Publish to $(summary_cell "$registry_label")"
   fi
   if [ -n "$manifest_display" ]; then
     summary_row "Manifest" "$(summary_code "$manifest_display")"
@@ -126,7 +145,7 @@ render_summary() {
   summary_row "Release tag" "$tag_cell"
   summary_row "Verification" "$verification_cell"
   summary_row "Package size" "$size_cell"
-  summary_row "crates.io" "$registry_cell"
+  summary_row "$(summary_cell "$registry_label")" "$registry_cell"
   if [ -n "$crate_sha256" ]; then
     summary_row "SHA-256" "$(summary_code "$crate_sha256")"
   fi
@@ -236,7 +255,7 @@ cargo_with_annotations() {
   while IFS= read -r line; do
     case "$line" in
       "warning: aborting upload due to dry run"* \
-        | *"already exists on crates.io index"*) continue ;;
+        | "warning: crate "*" already exists on "*) continue ;;
     esac
     message="${line#warning: }"
     if grep -Fqx -- "$message" "$work_dir/warnings.seen" 2> /dev/null; then
@@ -249,28 +268,29 @@ cargo_with_annotations() {
   done < <(grep '^warning: ' "$log" || true)
 }
 
-# A prefix assignment on 'exec', rather than an 'env NAME=value'
-# argument, keeps the token out of the process argument list. An
-# explicit token also forces Cargo's built-in provider: a project
+# Exporting the token inside the subshell, rather than passing an
+# 'env NAME=value' argument, keeps it out of the process argument list.
+# An explicit token also forces Cargo's built-in provider: a project
 # .cargo/config.toml could otherwise name a credential provider, which
 # Cargo would run with the token in its environment. Environment
 # settings outrank config files. The upload gets the same scrub as
-# every other stage, sparing only crates.io's token variables.
+# every other stage, sparing only its own registry's token variables.
 publishing_cargo() {
   local -a pin=()
+  local provider
   if [ -n "$toolchain_pin" ]; then
     pin=("RUSTUP_TOOLCHAIN=$toolchain_pin")
   fi
   (
     cd -- "$trusted_dir"
-    build_scrub CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
     if [ -n "$registry_token" ]; then
-      CARGO_REGISTRY_TOKEN="$registry_token" \
-        CARGO_REGISTRY_CREDENTIAL_PROVIDER=cargo:token \
-        CARGO_REGISTRIES_CRATES_IO_CREDENTIAL_PROVIDER=cargo:token \
-        CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS=cargo:token \
-        exec env "${scrub_args[@]}" ${pin[@]+"${pin[@]}"} cargo "$@"
+      export "${upload_token_vars[0]}=$registry_token" \
+        CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS=cargo:token
+      for provider in "${upload_provider_vars[@]}"; do
+        export "$provider=cargo:token"
+      done
     fi
+    build_scrub "${upload_token_vars[@]}"
     exec env "${scrub_args[@]}" ${pin[@]+"${pin[@]}"} cargo "$@"
   )
 }
@@ -322,16 +342,17 @@ index_path() {
   esac
 }
 
-# Look this version up in the crates.io index and compare its recorded
-# checksum, the SHA-256 of the published .crate, with ours. Sets
-# registry_status to absent, identical or different. On any failure it
-# sets lookup_error and returns 1, leaving the caller to decide.
+# Look this version up in the registry's sparse index and compare its
+# recorded checksum, the SHA-256 of the published .crate, with ours.
+# Sets registry_status to absent, identical or different. On any
+# failure it sets lookup_error and returns 1, leaving the caller to
+# decide.
 lookup_registry() {
   local body="$work_dir/index.json" code entry
   lookup_error=""
   if ! code="$(curl -sS --retry 3 -A "$user_agent" -o "$body" \
-    -w '%{http_code}' "$index_url/$(index_path "$crate_name")")"; then
-    lookup_error="could not reach the crates.io index for $crate_name"
+    -w '%{http_code}' "$index_base/$(index_path "$crate_name")")"; then
+    lookup_error="could not reach the $registry_label index for $crate_name"
     return 1
   fi
   case "$code" in
@@ -341,7 +362,13 @@ lookup_registry() {
       ;;
     200) ;;
     *)
-      lookup_error="the crates.io index answered HTTP $code for $crate_name"
+      # Cargo's sparse protocol lets other registries answer 410 or
+      # 451 for a crate they do not hold.
+      if [ -n "$registry" ] && { [ "$code" = 410 ] || [ "$code" = 451 ]; }; then
+        registry_status="absent"
+        return 0
+      fi
+      lookup_error="the $registry_label index answered HTTP $code for $crate_name"
       return 1
       ;;
   esac
@@ -349,7 +376,7 @@ lookup_registry() {
   # compare without it.
   if ! entry="$(jq -c --arg v "${crate_version%%+*}" \
     'select((.vers | split("+")[0]) == $v)' "$body")"; then
-    lookup_error="could not parse the crates.io index entry for $crate_name"
+    lookup_error="could not parse the $registry_label index entry for $crate_name"
     return 1
   fi
   entry="${entry%%$'\n'*}"
@@ -359,7 +386,7 @@ lookup_registry() {
   fi
   published_sha256="$(jq -r '.cksum // empty' <<< "$entry")"
   if [[ ! "$published_sha256" =~ ^[0-9a-f]{64}$ ]]; then
-    lookup_error="the crates.io index has no valid checksum for $crate_name $crate_version"
+    lookup_error="the $registry_label index has no valid checksum for $crate_name $crate_version"
     return 1
   fi
   if [ "$published_sha256" = "$crate_sha256" ]; then
@@ -376,6 +403,47 @@ query_registry() {
   fi
 }
 
+# An HTTPS URL with a host, no user information, and no query or
+# fragment: credentials in a URL would reach the job log and curl's
+# command line, and the action and Cargo append paths to these URLs.
+is_https_url() {
+  local pattern='^https://[^/?#@:[:space:][:cntrl:]][^/?#@[:space:][:cntrl:]]*(/[^?#[:space:][:cntrl:]]*)?$'
+  [[ "$1" =~ $pattern ]]
+}
+
+# A named registry describes itself in its index's config.json. Cargo
+# uploads to the 'api' URL there, sending the token, so it must use
+# HTTPS. An index that needs credentials to read is refused: the
+# action's lookups and every stage before the upload run without any.
+read_registry_config() {
+  local body="$work_dir/config.json" code api
+  if ! code="$(curl -sS --retry 3 -A "$user_agent" -o "$body" \
+    -w '%{http_code}' "$index_base/config.json")"; then
+    fail "could not reach the $registry_label index"
+  fi
+  case "$code" in
+    200) ;;
+    401 | 403)
+      fail "the $registry_label index requires authentication; this" \
+        "action reads registry indexes without credentials"
+      ;;
+    *) fail "the $registry_label index answered HTTP $code for config.json" ;;
+  esac
+  if ! jq -e 'type == "object"' "$body" > /dev/null 2>&1; then
+    fail "the $registry_label index config.json is not a JSON object"
+  fi
+  if [ "$(jq -r '."auth-required" == true' "$body")" = true ]; then
+    fail "the $registry_label index sets auth-required; this action" \
+      "reads registry indexes without credentials"
+  fi
+  api="$(jq -r '.api | strings' "$body")"
+  if ! is_https_url "$api"; then
+    fail "the $registry_label index config.json names no HTTPS 'api'" \
+      "URL, with a host, no credentials and no query, to publish to"
+  fi
+  echo "Registry: $registry, index $index_base, API $api"
+}
+
 # A crates.io token for Trusted Publishing is bound to the repository,
 # workflow file and optional environment. Name the first two, so a
 # rejected token can be checked against the crate's publisher settings.
@@ -386,7 +454,7 @@ describe_trusted_publisher() {
   echo "::notice::Trusted Publisher config surface for $crate_name:" \
     "repository ${GITHUB_REPOSITORY:-unknown}, workflow $workflow_file." \
     "If this job runs under a GitHub Actions environment, the" \
-    "crates.io Trusted Publisher config may need that environment too."
+    "$registry_label Trusted Publisher config may need that environment too."
 }
 
 ### Check inputs ###
@@ -410,6 +478,58 @@ fi
 if [ -n "$expected_sha256" ] \
   && [[ ! "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]; then
   fail "expected_sha256 must be 64 lowercase hexadecimal characters"
+fi
+
+# Cargo reads a named registry's settings from CARGO_REGISTRIES_<NAME>_*,
+# the name upper-cased with '-' as '_'. Its index must come from the
+# environment: every stage but 'Package' runs outside the project, so
+# no checked-in configuration would reach it, and a URL the repository
+# chose should never decide where the token goes.
+if [ -n "$registry" ]; then
+  # Cargo requires a letter or '_' first.
+  if [[ ! "$registry" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]]; then
+    fail "registry must start with a letter or _ and may contain only:" \
+      "A-Z a-z 0-9 _ -"
+  fi
+  registry_env="$(printf '%s' "$registry" | tr '[:lower:]' '[:upper:]')"
+  registry_env="${registry_env//-/_}"
+  # 'crates-io' is Cargo's own name for crates.io. Other spellings of it
+  # would name a different registry, yet share crates.io's
+  # CARGO_REGISTRIES_CRATES_IO_* settings, its token included.
+  if [ "$registry_env" = CRATES_IO ]; then
+    if [ "$registry" != crates-io ]; then
+      fail "registry must be 'crates-io' or empty to publish to crates.io"
+    fi
+    registry=""
+  fi
+fi
+if [ -n "$registry" ]; then
+  index_var="CARGO_REGISTRIES_${registry_env}_INDEX"
+  index_setting="${!index_var-}"
+  if [ -z "$index_setting" ]; then
+    fail "registry '$registry' needs its index URL in $index_var"
+  fi
+  # The action reads the index itself, over HTTPS; a git index would
+  # need a clone.
+  if [[ "$index_setting" != sparse+* ]] \
+    || ! is_https_url "${index_setting#sparse+}"; then
+    fail "$index_var must be a sparse index URL starting" \
+      "with 'sparse+https://', with a host, no credentials and no query"
+  fi
+  if [[ "$index_setting" != */ ]]; then
+    fail "$index_var must end in '/', as Cargo requires of a sparse index"
+  fi
+  index_base="${index_setting#sparse+}"
+  while [[ "$index_base" == */ ]]; do
+    index_base="${index_base%/}"
+  done
+  registry_label="$registry registry"
+  publish_registry="$registry"
+  package_registry=(--registry "$registry")
+  upload_token_vars=("CARGO_REGISTRIES_${registry_env}_TOKEN")
+  upload_provider_vars=("CARGO_REGISTRIES_${registry_env}_CREDENTIAL_PROVIDER")
+  replace_note="Cargo will not publish a version the registry already"
+  replace_note+=" holds: release a new one."
 fi
 
 for tool in cargo jq wc curl mktemp; do
@@ -484,6 +604,13 @@ trusted_dir="$work_dir/cwd"
 package_target="$work_dir/target"
 if ! mkdir -p "$trusted_dir" "$package_target"; then
   fail "could not prepare the temporary directory"
+fi
+
+### Read registry config ###
+
+if [ -n "$registry" ]; then
+  stage="Read registry config"
+  read_registry_config
 fi
 
 ### Check toolchain ###
@@ -588,11 +715,13 @@ fi
 stage="Package"
 crate_file="$package_target/package/$crate_name-$crate_version.crate"
 if [ -n "$expected_sha256" ]; then
-  trusted_cargo package --no-verify --locked --target-dir "$package_target" \
-    --manifest-path "$manifest_abs"
+  trusted_cargo package --no-verify --locked \
+    ${package_registry[@]+"${package_registry[@]}"} \
+    --target-dir "$package_target" --manifest-path "$manifest_abs"
   verification_cell="⏸️ Awaiting digest match"
 else
   cargo_with_annotations project_cargo package --locked \
+    ${package_registry[@]+"${package_registry[@]}"} \
     --target-dir "$package_target" --manifest-path "$manifest_abs"
   verification_cell="✅ Compiled and verified in this job"
 fi
@@ -632,12 +761,13 @@ if [ -n "$expected_sha256" ]; then
   echo "$crate_name package matches expected_sha256 ✅"
 fi
 
-### Check crates.io ###
+### Check the registry ###
 
-# crates.io never lets a version be replaced, even once yanked. The
+# crates.io never lets a version be replaced, even once yanked, and
+# Cargo refuses to publish a version any registry already holds. The
 # same bytes there already mean a re-run: skip. Different bytes mean
 # the version is taken: fail a release, warn an ordinary dry run.
-stage="Check crates.io"
+stage="Check $registry_label"
 query_registry
 case "$registry_status" in
   absent)
@@ -648,7 +778,7 @@ case "$registry_status" in
     if [ "$dry_run" = "false" ]; then
       write_output registry_status "$registry_status"
       publish_status="skipped"
-      echo "$crate_name $crate_version is already on crates.io with" \
+      echo "$crate_name $crate_version is already on $registry_label with" \
         "identical content; skipping the upload ⛔️"
       exit 0
     fi
@@ -657,12 +787,12 @@ case "$registry_status" in
     if [ "$release_intent" = "true" ]; then
       registry_cell="❌ Already published with different content"
       write_output registry_status "$registry_status"
-      fail "$crate_name $crate_version is already on crates.io with" \
+      fail "$crate_name $crate_version is already on $registry_label with" \
         "different content (published SHA-256 $published_sha256)." \
-        "crates.io never replaces a version: release a new one."
+        "$replace_note"
     fi
     registry_cell="⚠️ Already published with different content"
-    warn "$crate_name $crate_version is already on crates.io with" \
+    warn "$crate_name $crate_version is already on $registry_label with" \
       "different content; bump the version before releasing."
     ;;
 esac
@@ -673,7 +803,7 @@ write_output registry_status "$registry_status"
 # Registry-side checks only: nothing here compiles.
 stage="Dry-run publish"
 cargo_with_annotations trusted_cargo publish --dry-run --no-verify --locked \
-  --registry crates-io --target-dir "$package_target" \
+  --registry "$publish_registry" --target-dir "$package_target" \
   --manifest-path "$manifest_abs"
 
 ### Confirm package unchanged ###
@@ -686,8 +816,9 @@ cargo_with_annotations trusted_cargo publish --dry-run --no-verify --locked \
 # a byte-identical result: Cargo's archives are reproducible, and they
 # record the commit, so any change to the packaged inputs shows here.
 stage="Confirm package unchanged"
-trusted_cargo package --no-verify --locked --target-dir "$package_target" \
-  --manifest-path "$manifest_abs"
+trusted_cargo package --no-verify --locked \
+  ${package_registry[@]+"${package_registry[@]}"} \
+  --target-dir "$package_target" --manifest-path "$manifest_abs"
 if [ ! -f "$crate_file" ] \
   || [ "$(sha256_of "$crate_file")" != "$crate_sha256" ]; then
   fail "$crate_name package changed after verification; not publishing"
@@ -703,7 +834,7 @@ fi
 stage="Publish"
 describe_trusted_publisher
 upload_status=0
-publishing_cargo publish --no-verify --locked --registry crates-io \
+publishing_cargo publish --no-verify --locked --registry "$publish_registry" \
   --target-dir "$package_target" --manifest-path "$manifest_abs" \
   || upload_status=$?
 if [ "$upload_status" -ne 0 ]; then
@@ -714,7 +845,7 @@ if [ "$upload_status" -ne 0 ]; then
     registry_cell="✅ Already published, identical archive"
     write_output registry_status "$registry_status"
     publish_status="skipped"
-    warn "The upload failed, but crates.io already holds this exact" \
+    warn "The upload failed, but $registry_label already holds this exact" \
       "archive, likely from an earlier attempt; treating it as published."
     exit 0
   fi
@@ -722,4 +853,4 @@ if [ "$upload_status" -ne 0 ]; then
 fi
 published="true"
 publish_status="published"
-echo "Published $crate_name $crate_version to crates.io ✅"
+echo "Published $crate_name $crate_version to $registry_label ✅"

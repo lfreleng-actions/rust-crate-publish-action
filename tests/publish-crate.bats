@@ -56,6 +56,8 @@ setup() {
   unset MOCK_INDEX_STATUS_2 MOCK_INDEX_BODY_2 CARGO_TARGET_DIR
   unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
   unset ACTIONS_RUNTIME_TOKEN GITHUB_ENV GITHUB_PATH GITHUB_STATE
+  unset INPUT_REGISTRY MOCK_EXPECT_REGISTRY MOCK_CONFIG_STATUS
+  unset MOCK_CONFIG_BODY MOCK_DRY_RUN_EXISTS
   unset GITHUB_REPOSITORY GITHUB_WORKFLOW_REF RUSTUP_TOOLCHAIN
   # Host registry settings would reach the stand-ins and break the exact
   # scrub assertions.
@@ -838,6 +840,320 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
     grep -Fx "Publish failed with exit status 42; see the step log for Cargo's output." \
       "$GITHUB_STEP_SUMMARY"
   done
+}
+
+### registry: named Cargo registries ###
+
+readonly staging_index="sparse+https://index.staging.example/"
+readonly staging_vars="CARGO_REGISTRIES_STAGING_INDEX=$staging_index "
+
+# Target a registry named 'staging' with a sparse index stand-in.
+use_staging() {
+  export INPUT_REGISTRY=staging MOCK_EXPECT_REGISTRY=staging
+  export CARGO_REGISTRIES_STAGING_INDEX="$staging_index"
+}
+
+@test "an empty registry publishes to crates.io as before" {
+  local name
+  for name in "" crates-io; do
+    export INPUT_REGISTRY="$name"
+    reset_logs
+    run_action
+
+    [ "$status" -eq 0 ]
+    assert_calls "$publish_calls"
+    [ "$(cat "$MOCK_CURL_LOG")" = "https://index.crates.io/ex/am/example-crate" ]
+    [[ "$output" == *"Published example-crate 1.2.3 to crates.io"* ]]
+    grep -Fx '| Mode | Publish to crates.io |' "$GITHUB_STEP_SUMMARY"
+  done
+}
+
+@test "rejects other spellings of crates-io, which share its settings" {
+  local name
+  for name in crates_io CRATES-IO Crates_Io; do
+    export INPUT_REGISTRY="$name" CARGO_REGISTRIES_CRATES_IO_INDEX="$staging_index"
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"registry must be 'crates-io' or empty to publish to crates.io"* ]]
+    assert_no_cargo
+  done
+}
+
+@test "a named registry gets --registry on every package and publish call" {
+  use_staging
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls "$publish_calls"
+  [ "$(cat "$MOCK_CURL_LOG")" = "$(printf '%s\n' \
+    https://index.staging.example/config.json \
+    https://index.staging.example/ex/am/example-crate)" ]
+  [[ "$output" == *"Registry: staging, index https://index.staging.example, API https://api.example.test"* ]]
+  [[ "$output" == *"Published example-crate 1.2.3 to staging registry"* ]]
+  [ "$(output_value published)" = true ]
+}
+
+@test "expected_sha256 packages for the named registry too" {
+  use_staging
+  INPUT_EXPECTED_SHA256="$(zero_sha256 32)"
+  export INPUT_EXPECTED_SHA256
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls $'version\nmetadata\nrepackage\ndry-run\nrepackage\npublish'
+}
+
+@test "maps a hyphenated registry name to Cargo's variable names" {
+  export INPUT_REGISTRY=my-registry MOCK_EXPECT_REGISTRY=my-registry
+  export CARGO_REGISTRIES_MY_REGISTRY_INDEX="$staging_index"
+  export INPUT_REGISTRY_TOKEN=input-token
+  run_action
+
+  [ "$status" -eq 0 ]
+  [[ "$(stage_vars publish)" == *"CARGO_REGISTRIES_MY_REGISTRY_TOKEN=input-token "* ]]
+}
+
+@test "fails clearly when a named registry has no index URL" {
+  local permit
+  for permit in false true; do
+    export INPUT_REGISTRY=staging INPUT_PERMIT_FAIL="$permit"
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"registry 'staging' needs its index URL in CARGO_REGISTRIES_STAGING_INDEX"* ]]
+    assert_no_cargo
+    [ ! -s "$MOCK_CURL_LOG" ]
+  done
+}
+
+@test "rejects registry names outside the allowed character set" {
+  local name
+  for name in 'a b' 'a;b' '../x' 'a.b' 'a/b' $'staging\n::error::injected' \
+    -private --version 9reg; do
+    export INPUT_REGISTRY="$name"
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"registry must start with a letter or _ and may contain only: A-Z a-z 0-9 _ -"* ]]
+    [[ "$output" != *"injected"* ]]
+    assert_no_cargo
+  done
+}
+
+@test "requires a sparse+https index URL for a named registry" {
+  local index
+  for index in https://github.com/example/index sparse+http://index.example/ \
+    'sparse+https://index.example/a b' git+https://index.example/ \
+    $'sparse+https://index.example/\n::error::injected' sparse+https:///index \
+    sparse+https://:443/ 'sparse+https://user:injected@index.example/' \
+    'sparse+https://injected@index.example/' sparse+https://?q \
+    'sparse+https://index.example/cargo?x=1' 'sparse+https://index.example/#x'; do
+    export INPUT_REGISTRY=staging CARGO_REGISTRIES_STAGING_INDEX="$index"
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"CARGO_REGISTRIES_STAGING_INDEX must be a sparse index URL starting with 'sparse+https://', with a host, no credentials and no query"* ]]
+    [[ "$output" != *"injected"* ]]
+    assert_no_cargo
+    [ ! -s "$MOCK_CURL_LOG" ]
+  done
+}
+
+@test "requires the trailing slash Cargo needs on a sparse index URL" {
+  local index
+  for index in sparse+https://index.example sparse+https://index.example/cargo; do
+    export INPUT_REGISTRY=staging CARGO_REGISTRIES_STAGING_INDEX="$index"
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"CARGO_REGISTRIES_STAGING_INDEX must end in '/', as Cargo requires of a sparse index"* ]]
+    assert_no_cargo
+    [ ! -s "$MOCK_CURL_LOG" ]
+  done
+}
+
+@test "drops trailing slashes from the index URL" {
+  use_staging
+  export CARGO_REGISTRIES_STAGING_INDEX="sparse+https://index.staging.example///"
+  export INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(head -1 "$MOCK_CURL_LOG")" = https://index.staging.example/config.json ]
+}
+
+@test "refuses a registry whose index needs authentication" {
+  use_staging
+  local case
+  for case in status body; do
+    if [ "$case" = status ]; then
+      export MOCK_CONFIG_STATUS=401
+    else
+      export MOCK_CONFIG_STATUS=200
+      export MOCK_CONFIG_BODY='{"api":"https://api.example.test","auth-required":true}'
+    fi
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"this action reads registry indexes without credentials"* ]]
+    grep -F 'Failed at Read registry config' "$GITHUB_STEP_SUMMARY"
+    assert_no_cargo
+    reset_logs
+  done
+}
+
+@test "refuses a registry config without an HTTPS api URL" {
+  use_staging
+  local body
+  for body in '{"dl":"https://dl.example.test"}' '{"api":"http://api.example.test"}' \
+    '{"api":"https://api.example.test/a b"}' '{"api":7}' '[]' 'not json' \
+    '{"api":"https:///upload"}' '{"api":"https://?query"}' \
+    '{"api":"https://user:secret@api.example.test"}' \
+    '{"api":"https://api.example.test/cargo?x=1"}' \
+    '{"api":"https://api.example.test/#x"}'; do
+    export MOCK_CONFIG_BODY="$body"
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"staging registry index config.json"* ]]
+    [[ "$output" != *secret* ]]
+    assert_no_cargo
+  done
+}
+
+@test "accepts index and api URLs with a port and path, and names led by _" {
+  export INPUT_REGISTRY=_staging MOCK_EXPECT_REGISTRY=_staging
+  export CARGO_REGISTRIES__STAGING_INDEX="sparse+https://index.example:8443/cargo/"
+  export MOCK_CONFIG_BODY='{"api":"https://api.example.test:8443/cargo"}'
+  export INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(head -1 "$MOCK_CURL_LOG")" = https://index.example:8443/cargo/config.json ]
+  [[ "$output" == *"API https://api.example.test:8443/cargo"* ]]
+}
+
+@test "fails closed when the registry config cannot be read" {
+  use_staging
+  export MOCK_CONFIG_STATUS=500
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"the staging registry index answered HTTP 500 for config.json"* ]]
+  assert_no_cargo
+
+  export MOCK_CURL_FAIL=true
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"could not reach the staging registry index"* ]]
+}
+
+@test "an identical archive on a named registry skips the upload" {
+  use_staging
+  index_entry 1.2.3 "$(zero_sha256 32)"
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls $'version\nmetadata\npackage'
+  [ "$(tail -1 "$MOCK_CURL_LOG")" = https://index.staging.example/ex/am/example-crate ]
+  [[ "$output" == *"already on staging registry with identical content"* ]]
+  [ "$(output_value publish_status)" = skipped ]
+  grep -F '| staging registry | ✅ Already published, identical archive |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "different content on a named registry fails a real publish" {
+  use_staging
+  index_entry 1.2.3 "$(zero_sha256 99)"
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"already on staging registry with different content (published SHA-256 $(zero_sha256 99)). Cargo will not publish a version the registry already holds: release a new one."* ]]
+  assert_calls $'version\nmetadata\npackage'
+  grep -F 'Failed at Check staging registry' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "a named registry may answer 410 or 451 for an absent crate" {
+  local code
+  for code in 410 451; do
+    use_staging
+    export MOCK_INDEX_STATUS="$code" INPUT_DRY_RUN=true
+    run_action
+
+    [ "$status" -eq 0 ]
+    [ "$(output_value registry_status)" = absent ]
+
+    # crates.io answers 404, so anything else there still fails closed.
+    unset INPUT_REGISTRY MOCK_EXPECT_REGISTRY
+    reset_logs
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"the crates.io index answered HTTP $code"* ]]
+    reset_logs
+  done
+}
+
+@test "the dry run's already-exists warning is never an annotation" {
+  export INPUT_DRY_RUN=true
+  local where
+  # shellcheck disable=SC2016 # Cargo quotes registry names in backticks
+  for where in 'crates.io index' '`staging` index'; do
+    if [ "$where" != 'crates.io index' ]; then
+      use_staging
+    fi
+    export MOCK_DRY_RUN_EXISTS="$where"
+    reset_logs
+    run_action
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already exists on $where"* ]]
+    [[ "$output" != *"::warning title=cargo::crate"* ]]
+  done
+}
+
+@test "registry_token reaches a named registry's upload alone, under its name" {
+  use_staging
+  export INPUT_REGISTRY_TOKEN=input-token CARGO_REGISTRY_TOKEN=crates-io-token
+  run_action
+
+  [ "$status" -eq 0 ]
+  local stage
+  for stage in version metadata package dry-run repackage; do
+    [ "$(stage_vars "$stage")" = "$staging_vars" ]
+  done
+  [ "$(cat "$MOCK_RUSTUP_VARS")" = "$staging_vars" ]
+  [ "$(stage_vars publish)" = "CARGO_REGISTRIES_STAGING_CREDENTIAL_PROVIDER=cargo:token ${staging_vars}CARGO_REGISTRIES_STAGING_TOKEN=input-token CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS=cargo:token " ]
+}
+
+@test "a named registry's upload keeps the caller's token for it, and no other" {
+  use_staging
+  export_scrubbed_variables
+  export CARGO_REGISTRIES_STAGING_TOKEN=staging-token
+  run_action
+
+  [ "$status" -eq 0 ]
+  local stage
+  local kept="CARGO_REGISTRIES_PRIVATE_INDEX=sparse+https://private.example/ $staging_vars"
+  for stage in version metadata package dry-run repackage; do
+    [ "$(stage_vars "$stage")" = "$kept" ]
+  done
+  [ "$(stage_vars publish)" = "${kept}CARGO_REGISTRIES_STAGING_TOKEN=staging-token " ]
+}
+
+@test "a named registry's summary names it and links nowhere" {
+  use_staging
+  run_action
+
+  [ "$status" -eq 0 ]
+  grep -Fx '| Mode | Publish to staging registry |' "$GITHUB_STEP_SUMMARY"
+  grep -Fx '| staging registry | ✅ Version not yet published |' \
+    "$GITHUB_STEP_SUMMARY"
+  if grep -F -e '| Link |' -e 'crates.io' "$GITHUB_STEP_SUMMARY"; then
+    false
+  fi
 }
 
 ### permit_fail ###

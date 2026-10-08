@@ -13,12 +13,13 @@
 
 Packages a Rust crate, checks its size against the crates.io upload cap,
 verifies its version against a release tag, and publishes it to
-crates.io.
+crates.io or another Cargo registry.
 
 ## rust-crate-publish-action
 
-The action publishes one crate per call. It targets crates.io and
-suits
+The action publishes one crate per call. It targets crates.io unless
+`registry` names another Cargo registry, such as
+[staging.crates.io](https://staging.crates.io), and suits
 [Trusted Publishing](https://crates.io/docs/trusted-publishing), where
 the calling workflow exchanges a GitHub OIDC token for a short-lived
 crates.io token. The action never requests OIDC tokens itself: the
@@ -150,6 +151,99 @@ instead:
 
 <!-- markdownlint-enable MD013 MD046 -->
 
+### Publish to another Cargo registry
+
+Set `registry` to a registry name (as Cargo requires, a letter or `_`
+first, then letters, digits, `_` or `-`), and its sparse index URL in
+`CARGO_REGISTRIES_<NAME>_INDEX`, where `<NAME>` is the name in upper
+case with `-` as `_`. The action then passes `--registry <name>` to
+every `cargo package` and `cargo publish` call, checks the version
+against that registry's index, and hands `registry_token` to the
+upload alone as `CARGO_REGISTRIES_<NAME>_TOKEN`. With `registry_token`
+empty, the upload uses the caller's `CARGO_REGISTRIES_<NAME>_TOKEN`; a
+crates.io token never reaches it.
+
+The crates.io staging site accepts Trusted Publishing.
+`rust-lang/crates-io-auth-action` reaches it through its `url` input,
+and both jobs must name the same registry, since Cargo packages for
+the registry it targets:
+
+<!-- markdownlint-disable MD013 MD046 -->
+
+```yaml
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_REGISTRIES_STAGING_INDEX: "sparse+https://index.staging.crates.io/"
+    outputs:
+      crate_sha256: ${{ steps.verify.outputs.crate_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Verify crate"
+        id: verify
+        uses: lfreleng-actions/rust-crate-publish-action@main
+        with:
+          registry: staging
+          dry_run: 'true'
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Mint the OIDC token staging.crates.io exchanges
+    env:
+      CARGO_REGISTRIES_STAGING_INDEX: "sparse+https://index.staging.crates.io/"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Authenticate with staging.crates.io"
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        with:
+          url: "https://staging.crates.io"
+
+      - name: "Publish crate to staging"
+        uses: lfreleng-actions/rust-crate-publish-action@main
+        with:
+          registry: staging
+          registry_token: ${{ steps.auth.outputs.token }}
+          expected_sha256: ${{ needs.verify.outputs.crate_sha256 }}
+```
+
+<!-- markdownlint-enable MD013 MD046 -->
+
+Staging keeps its own accounts, crates and Trusted Publisher
+configurations, apart from crates.io. As on crates.io, the first
+version of a crate needs an API token; configure the Trusted Publisher
+after that.
+
+A named registry must offer:
+
+- A sparse index over HTTPS (`sparse+https://`, ending in `/` as Cargo
+  requires), which the action reads for the version check. It refuses
+  git indexes, and index or `api` URLs without a host, with a query or
+  fragment, or with credentials in them (`https://user:secret@...`),
+  which would reach the job log.
+- An index anyone can read: it refuses `auth-required` registries,
+  since the upload alone holds a token.
+- An HTTPS `api` URL in the index's `config.json`, where Cargo
+  uploads.
+
+The action has no built-in name for staging. A reserved name would
+send the token to crates.io staging whenever a caller forgot to set
+the index of a registry of their own called `staging`; setting the
+index keeps the destination explicit. `crates-io`, Cargo's own name
+for crates.io, means the same as an empty `registry`.
+
 ## Requirements
 
 - Bash, `cargo`, `jq`, `curl`, `mktemp`, and `sha256sum` or `shasum`
@@ -168,23 +262,28 @@ instead:
 - Network access to `index.crates.io` for the version check and the
   dry run, plus `static.crates.io` to download dependencies and
   `crates.io` to publish. Block-mode egress policies must admit these
-  hosts; the `lfreleng-actions` allow-list does from v0.16.3.
+  hosts; the `lfreleng-actions` allow-list does from v0.16.3. A named
+  registry needs its index host, its `dl` host when the crate has
+  dependencies there, and its `api` host to publish. For staging
+  these are `index.staging.crates.io`, `static.staging.crates.io` and
+  `staging.crates.io`.
 
 ## Inputs
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                 | Required | Default      | Description                                                                                     |
-| -------------------- | -------- | ------------ | ----------------------------------------------------------------------------------------------- |
-| path_prefix          | False    | `.`          | Directory containing the crate or workspace; must resolve within the workspace                  |
-| manifest_path        | False    | `Cargo.toml` | Path to the crate's `Cargo.toml`, relative to `path_prefix`                                     |
-| release_tag          | False    |              | Release tag that the `Cargo.toml` version must match, one leading `v` ignored                   |
-| max_crate_size_bytes | False    | `10485760`   | Largest allowed packaged `.crate` size in bytes; the default matches the crates.io 10MB cap     |
-| dry_run              | False    | `false`      | Check and package without publishing; needs no credentials                                      |
-| registry_token       | False    |              | crates.io token for the upload alone; empty falls back to the caller's Cargo credentials        |
-| expected_sha256      | False    |              | `crate_sha256` from an earlier `dry_run` job; skips compilation and refuses a differing archive |
-| permit_fail          | False    | `false`      | Report success even when a stage fails                                                          |
-| summary              | False    | `true`       | Write a crate table to the job summary                                                          |
+| Name                 | Required | Default      | Description                                                                                                    |
+| -------------------- | -------- | ------------ | -------------------------------------------------------------------------------------------------------------- |
+| path_prefix          | False    | `.`          | Directory containing the crate or workspace; must resolve within the workspace                                 |
+| manifest_path        | False    | `Cargo.toml` | Path to the crate's `Cargo.toml`, relative to `path_prefix`                                                    |
+| release_tag          | False    |              | Release tag that the `Cargo.toml` version must match, one leading `v` ignored                                  |
+| max_crate_size_bytes | False    | `10485760`   | Largest allowed packaged `.crate` size in bytes; the default matches the crates.io 10MB cap                    |
+| dry_run              | False    | `false`      | Check and package without publishing; needs no credentials                                                     |
+| registry             | False    |              | Cargo registry name to publish to; empty or `crates-io` means crates.io. Needs `CARGO_REGISTRIES_<NAME>_INDEX` |
+| registry_token       | False    |              | Registry token for the upload alone; empty falls back to the caller's Cargo credentials                        |
+| expected_sha256      | False    |              | `crate_sha256` from an earlier `dry_run` job; skips compilation and refuses a differing archive                |
+| permit_fail          | False    | `false`      | Report success even when a stage fails                                                                         |
+| summary              | False    | `true`       | Write a crate table to the job summary                                                                         |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -200,9 +299,9 @@ value fails the run.
 | crate_name       | Crate name, read from its `Cargo.toml`                                                   |
 | crate_version    | Crate version, read from its `Cargo.toml`                                                |
 | crate_size_bytes | Packaged `.crate` file size in bytes                                                     |
-| crate_sha256     | SHA-256 of the verified `.crate`, as crates.io records it                                |
+| crate_sha256     | SHA-256 of the verified `.crate`, as the registry index records it                       |
 | cargo_version    | Cargo version that packaged the crate                                                    |
-| registry_status  | This version on crates.io: `absent`, `identical` (same archive) or `different`           |
+| registry_status  | This version on the target registry: `absent`, `identical` (same archive) or `different` |
 | publish_status   | Outcome: `published`, `skipped` (identical archive already there), `dry-run` or `failed` |
 | published        | `true` when this run uploaded the crate; `false` for a skip too, see `publish_status`    |
 
@@ -216,29 +315,34 @@ The action runs these stages in order, and the first failure stops it:
    release tag character set, and confirms that `path_prefix` and
    `manifest_path` resolve within `GITHUB_WORKSPACE`. A symlinked
    `Cargo.toml` fails, since it could point outside the workspace.
-2. **Check toolchain**: asks rustup which toolchain the project
+   A named `registry` needs a valid name and a sparse HTTPS index URL.
+2. **Read registry config**: for a named `registry` alone, reads the
+   index's `config.json` and requires an HTTPS `api` URL and no
+   `auth-required`.
+3. **Check toolchain**: asks rustup which toolchain the project
    selects, without running it, and pins that channel for every later
    stage. A path-based toolchain stops any release; see below.
-3. **Read crate metadata**: `cargo metadata --no-deps` selects the
+4. **Read crate metadata**: `cargo metadata --no-deps` selects the
    package whose manifest matches `manifest_path`, which works for
    workspace members.
-4. **Verify release tag**: when `release_tag` holds a value, the
+5. **Verify release tag**: when `release_tag` holds a value, the
    crate version must equal it, after removing one leading `v`.
-5. **Package**: `cargo package --locked` builds the `.crate` file and
+6. **Package**: `cargo package --locked` builds the `.crate` file and
    compiles it, proving the packaged sources build. With
    `expected_sha256`, it packages with `--no-verify` and compiles
    nothing.
-6. **Check package size**: compares the `.crate` file against
+7. **Check package size**: compares the `.crate` file against
    `max_crate_size_bytes`.
-7. **Match verified digest**: with `expected_sha256`, the `.crate`
+8. **Match verified digest**: with `expected_sha256`, the `.crate`
    must match it byte for byte.
-8. **Check crates.io**: looks the version up in the crates.io index
-   and compares its recorded checksum with the `.crate`; see below.
-9. **Dry-run publish**: `cargo publish --dry-run` runs the registry
-   checks without uploading.
-10. **Confirm package unchanged**: repackages without running crate
+9. **Check crates.io**, or the named registry: looks the version up
+   in the registry's index and compares its recorded checksum with
+   the `.crate`; see below.
+10. **Dry-run publish**: `cargo publish --dry-run` runs the registry
+    checks without uploading.
+11. **Confirm package unchanged**: repackages without running crate
     code and requires a byte-identical `.crate`; see below.
-11. **Publish**: unless `dry_run` is `true`, uploads the crate.
+12. **Publish**: unless `dry_run` is `true`, uploads the crate.
 
 Packages go to a target directory the action creates, and it removes
 that directory afterwards, so the checkout stays untouched.
@@ -280,16 +384,19 @@ Nothing the repository supplies ever runs as the uploading `cargo`.
 
 ### Already published versions
 
-crates.io never lets anyone replace a version, even once yanked. Before
-the dry run, the action looks the version up in the crates.io index,
-whose recorded checksum is the SHA-256 of the published `.crate`, and
-compares it with `crate_sha256`:
+crates.io never lets anyone replace a version, even once yanked, and
+Cargo refuses to publish a version any registry already holds. Before
+the dry run, the action looks the version up in the target registry's
+sparse index, whose recorded checksum is the SHA-256 of the published
+`.crate`, and compares it with `crate_sha256`. A named registry may
+answer 404, 410 or 451 for a crate it lacks, as Cargo's sparse
+protocol allows; crates.io must answer 404:
 
 <!-- markdownlint-disable MD013 -->
 
 <!-- markdownlint-disable MD013 MD060 -->
 
-| On crates.io      | Plain dry run             | Dry run with `release_tag` | Upload                             |
+| In the registry   | Plain dry run             | Dry run with `release_tag` | Upload                             |
 | ----------------- | ------------------------- | -------------------------- | ---------------------------------- |
 | Absent            | ✅ Pass                   | ✅ Pass                    | Upload                             |
 | Identical archive | ✅ Pass                   | ✅ Pass                    | ⛔️ Skip, `publish_status: skipped` |
@@ -352,6 +459,9 @@ depth rather than isolation:
 With `registry_token` set, the upload also forces Cargo's built-in
 `cargo:token` credential provider. With `registry_token` empty, the
 upload uses whatever credentials and provider the caller configured.
+For a named registry, the token reaches the upload as
+`CARGO_REGISTRIES_<NAME>_TOKEN`, and the upload gets no crates.io
+token variable.
 
 ### Package integrity
 
@@ -423,8 +533,10 @@ warnings, Cargo's own included. For example:
 Headlines distinguish 🚀 published, ⛔️ skipped as already
 published, ✅ dry run passed, and ❌ failed at a named stage, with
 ⚠️ marking a failure that `permit_fail` let through. Checks the run
-never reached read "Not reached". A published or skipped crate links
-to its crates.io page. The summary never includes credentials.
+never reached read "Not reached". A crate published to or skipped on
+crates.io links to its crates.io page; for a named registry, the
+summary names the registry and gives no link. The summary never
+includes credentials.
 
 ## Testing
 
@@ -432,10 +544,13 @@ to its crates.io page. The summary never includes credentials.
 
 - Unit tests: [Bats](https://github.com/bats-core/bats-core) suites
   in `tests/` drive `scripts/publish-crate.sh` against stand-ins for
-  Cargo, rustup and the crates.io index, covering each stage, input
-  validation, credential handling and the summary.
+  Cargo, rustup and the registry index, covering each stage, input
+  validation, credential handling, named registries and the summary.
 - Dry runs against a generated two-member workspace and against
-  [test-rust-project](https://github.com/lfreleng-actions/test-rust-project).
+  [test-rust-project](https://github.com/lfreleng-actions/test-rust-project),
+  the latter also through a named registry whose index is crates.io's
+  own. CI never publishes, so no test reaches a registry's upload
+  API.
 - Failure cases, which must fail closed.
 - Release safeguards against real rustup and the live crates.io
   index: a path-based toolchain, and a version already published
