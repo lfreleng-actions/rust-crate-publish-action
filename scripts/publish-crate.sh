@@ -517,7 +517,17 @@ if [ -n "$release_tag" ] && [[ ! "$release_tag" =~ ^[0-9A-Za-z._+-]+$ ]]; then
   fail "release_tag may contain only: 0-9 A-Z a-z . _ + -"
 fi
 
-if [ -n "$expected_sha256" ] \
+if expected_is_map; then
+  # Parsing the map needs jq, before the tool checks below run.
+  if ! command -v jq > /dev/null 2>&1; then
+    fail "required tool not found on PATH: jq"
+  fi
+  if ! expected_sha256="$(parse_digest_map)"; then
+    expected_sha256=""
+    fail "expected_sha256 must be one digest, or a JSON object mapping" \
+      "each crate name to 64 lowercase hexadecimal characters"
+  fi
+elif [ -n "$expected_sha256" ] \
   && [[ ! "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]; then
   fail "expected_sha256 must be 64 lowercase hexadecimal characters"
 fi
@@ -719,9 +729,11 @@ metadata="$(trusted_cargo metadata --no-deps --locked --format-version 1 \
 # manifest_path had named it; several are published as a set.
 if [ "$selection_mode" != "manifest" ]; then
   select_crates "$selection_mode"
-  if [ -n "$expected_sha256" ] && [ "${#set_names[@]}" -gt 1 ]; then
+  if expected_is_map; then
+    require_digest_keys "${set_names[@]}"
+  elif [ -n "$expected_sha256" ] && [ "${#set_names[@]}" -gt 1 ]; then
     fail "expected_sha256 holds one digest, but ${#set_names[@]} crates" \
-      "are selected"
+      "are selected; pass the verifying run's crate_sha256 JSON object"
   fi
   if [ "${#set_names[@]}" -gt 1 ]; then
     publish_crate_set
@@ -750,6 +762,10 @@ fi
 write_output crate_name "$crate_name"
 write_output crate_version "$crate_version"
 echo "Crate: $crate_name $crate_version"
+if expected_is_map; then
+  require_digest_keys "$crate_name"
+  expected_sha256="$(jq -r --arg n "$crate_name" '.[$n]' <<< "$expected_sha256")"
+fi
 
 ### Verify release tag ###
 

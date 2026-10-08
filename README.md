@@ -119,24 +119,33 @@ steps:
 ### Publish workspace members in dependency order
 
 Set `workspace` to `true` to publish every member that crates.io
-accepts, or list members in `packages`. Cargo packages the whole
-selection as one set, so a member whose sibling dependency is not on
-crates.io yet still verifies. Crates.io must list a Trusted Publisher
-for each crate.
+accepts, or list members in `packages`. The two-job pattern above works
+for a workspace too: `crate_sha256` becomes a JSON object of crate
+names to digests, which `expected_sha256` accepts as it stands.
+Cargo packages the whole selection as one set, so a member whose
+sibling dependency is not on crates.io yet still verifies. Crates.io
+must list a Trusted Publisher for each crate.
 
 <!-- markdownlint-disable MD013 MD046 -->
 
 ```yaml
-- name: "Authenticate with crates.io"
-  id: auth
-  uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+# In the verify job
+- name: "Verify workspace crates"
+  id: verify
+  uses: lfreleng-actions/rust-crate-publish-action@main
+  with:
+    workspace: 'true'
+    release_tag: ${{ github.event.release.tag_name }}
+    dry_run: 'true'
 
+# In the publish job, after authenticating
 - name: "Publish workspace crates"
   uses: lfreleng-actions/rust-crate-publish-action@main
   with:
     workspace: 'true'
     release_tag: ${{ github.event.release.tag_name }}
     registry_token: ${{ steps.auth.outputs.token }}
+    expected_sha256: ${{ needs.verify.outputs.crate_sha256 }}
 ```
 
 <!-- markdownlint-enable MD013 MD046 -->
@@ -273,21 +282,21 @@ for crates.io, means the same as an empty `registry`.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                 | Required | Default      | Description                                                                                                                |
-| -------------------- | -------- | ------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| path_prefix          | False    | `.`          | Directory containing the crate or workspace; must resolve within the workspace                                             |
-| manifest_path        | False    | `Cargo.toml` | Path to the crate's `Cargo.toml`, relative to `path_prefix`; with `workspace` or `packages`, any manifest of the workspace |
-| workspace            | False    | `false`      | Publish every workspace member that the target registry accepts, in dependency order                                       |
-| packages             | False    |              | Whitespace-separated workspace members to publish, in dependency order; replaces `workspace`                               |
-| exclude              | False    |              | Whitespace-separated members to leave out; needs `workspace: true` and an empty `packages`                                 |
-| release_tag          | False    |              | Release tag that every selected crate's version must match, one leading `v` ignored                                        |
-| max_crate_size_bytes | False    | `10485760`   | Largest allowed packaged `.crate` size in bytes; the default matches the crates.io 10MB cap                                |
-| dry_run              | False    | `false`      | Check and package without publishing; needs no credentials                                                                 |
-| registry             | False    |              | Cargo registry name to publish to; empty or `crates-io` means crates.io. Needs `CARGO_REGISTRIES_<NAME>_INDEX`             |
-| registry_token       | False    |              | Registry token for the upload alone; empty falls back to the caller's Cargo credentials                                    |
-| expected_sha256      | False    |              | `crate_sha256` from an earlier `dry_run` job; skips compilation and refuses a differing archive                            |
-| permit_fail          | False    | `false`      | Report success even when a stage fails                                                                                     |
-| summary              | False    | `true`       | Write a crate table to the job summary                                                                                     |
+| Name                 | Required | Default      | Description                                                                                                                           |
+| -------------------- | -------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| path_prefix          | False    | `.`          | Directory containing the crate or workspace; must resolve within the workspace                                                        |
+| manifest_path        | False    | `Cargo.toml` | Path to the crate's `Cargo.toml`, relative to `path_prefix`; with `workspace` or `packages`, any manifest of the workspace            |
+| workspace            | False    | `false`      | Publish every workspace member that the target registry accepts, in dependency order                                                  |
+| packages             | False    |              | Whitespace-separated workspace members to publish, in dependency order; replaces `workspace`                                          |
+| exclude              | False    |              | Whitespace-separated members to leave out; needs `workspace: true` and an empty `packages`                                            |
+| release_tag          | False    |              | Release tag that every selected crate's version must match, one leading `v` ignored                                                   |
+| max_crate_size_bytes | False    | `10485760`   | Largest allowed packaged `.crate` size in bytes; the default matches the crates.io 10MB cap                                           |
+| dry_run              | False    | `false`      | Check and package without publishing; needs no credentials                                                                            |
+| registry             | False    |              | Cargo registry name to publish to; empty or `crates-io` means crates.io. Needs `CARGO_REGISTRIES_<NAME>_INDEX`                        |
+| registry_token       | False    |              | Registry token for the upload alone; empty falls back to the caller's Cargo credentials                                               |
+| expected_sha256      | False    |              | `crate_sha256` from an earlier `dry_run` job, a JSON object for two or more crates; skips compilation and refuses a differing archive |
+| permit_fail          | False    | `false`      | Report success even when a stage fails                                                                                                |
+| summary              | False    | `true`       | Write a crate table to the job summary                                                                                                |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -394,9 +403,12 @@ of `true` would make those callers publish every member.
   lists other registries but not the target, and cannot leave out
   members that are on the registry already. Every stage covers the
   whole set before the next begins, and each check applies per crate.
-- **Digests.** With two or more crates, `crate_sha256` is a compact JSON
-  object of crate name to digest. `expected_sha256` takes a single
-  digest, so it cannot cover two or more crates; such a call fails.
+- **Digests.** With two or more crates, `crate_sha256` is a compact
+  JSON object of crate name to digest, and `expected_sha256` takes
+  that object back: it must be one JSON object, without repeated
+  keys, naming the selected crates and no others, each with 64
+  lowercase hexadecimal characters. A single digest for two or more
+  crates fails. A one-entry object also works for a single crate.
 - **Release tag.** One tag covers the set: every selected crate's
   version must equal `release_tag`. A GitHub release carries a single
   tag, so per-crate tags such as `<crate>-v<version>` would need a run

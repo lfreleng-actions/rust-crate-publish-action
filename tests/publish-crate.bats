@@ -1830,6 +1830,93 @@ MARKDOWN
 
 ### Workspace digests ###
 
+@test "a set's crate_sha256 map feeds expected_sha256 in a later run" {
+  standard_workspace
+  export INPUT_DRY_RUN=true
+  run_action
+  [ "$status" -eq 0 ]
+
+  INPUT_EXPECTED_SHA256="$(output_value crate_sha256)"
+  export INPUT_EXPECTED_SHA256 INPUT_DRY_RUN=false
+  reset_logs
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls $'version\nmetadata\nrepackage\ndry-run\nrepackage\npublish'
+  [ "$(output_value crate_sha256)" = "$INPUT_EXPECTED_SHA256" ]
+  grep -Fq 'Matches the digests from an earlier job; not compiled here' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "expected_sha256 accepts a map in any key order and layout" {
+  standard_workspace
+  INPUT_EXPECTED_SHA256="$(jq -n --argjson m "$(digest_map alpha zeta mid)" '$m')"
+  export INPUT_EXPECTED_SHA256
+  [[ "$INPUT_EXPECTED_SHA256" == *$'\n'* ]]
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(output_value published)" = true ]
+}
+
+@test "expected_sha256 refuses a set with one differing archive" {
+  standard_workspace
+  INPUT_EXPECTED_SHA256="$(digest_map zeta mid alpha | jq -c --arg d "$(zero_sha256 1)" '.mid = $d')"
+  export INPUT_EXPECTED_SHA256
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"mid package does not match its expected_sha256 entry"* ]]
+  assert_calls $'version\nmetadata\nrepackage'
+}
+
+@test "rejects malformed digest maps before running cargo" {
+  local digest map
+  digest="$(zero_sha256 1)"
+  for map in '{' '{}' '[]' '{"a":1}' '{"a":"ABC"}' "{\"a\":\"${digest^^}\"}" \
+    "{\"a b\":\"$digest\"}" "{\"a\":{\"b\":\"$digest\"}}" \
+    "{\"a\":\"$digest\",\"a\":\"$digest\"}" \
+    "{\"a\":\"$digest\"} {\"b\":\"$digest\"}"; do
+    export INPUT_EXPECTED_SHA256="$map"
+    reset_logs
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"::error::expected_sha256 must be "* ]]
+    assert_no_cargo
+  done
+}
+
+@test "a digest map without jq on PATH names the missing tool" {
+  local tool saved_path="$PATH"
+  mkdir -p "$workdir/no-jq"
+  for tool in wc dirname env; do
+    ln -s "$(command -v "$tool")" "$workdir/no-jq/$tool"
+  done
+  INPUT_EXPECTED_SHA256="$(digest_map example-crate)"
+  export INPUT_EXPECTED_SHA256
+  export PATH="$workdir/no-jq"
+  run_action
+  export PATH="$saved_path"
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"required tool not found on PATH: jq"* ]]
+}
+
+@test "a digest map must name exactly the selected crates" {
+  standard_workspace
+  local map
+  for map in "$(digest_map zeta mid)" "$(digest_map zeta mid alpha internal)"; do
+    export INPUT_EXPECTED_SHA256="$map"
+    reset_logs
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"expected_sha256 must name exactly the selected crates: zeta mid alpha"* ]]
+    assert_calls $'version\nmetadata'
+  done
+}
+
 @test "a single digest cannot cover several crates" {
   standard_workspace
   INPUT_EXPECTED_SHA256="$(zero_sha256 32)"
@@ -1838,6 +1925,23 @@ MARKDOWN
 
   [ "$status" -eq 1 ]
   [[ "$output" == *"expected_sha256 holds one digest, but 3 crates are selected"* ]]
+  assert_calls $'version\nmetadata'
+}
+
+@test "a one-entry digest map works for a single crate" {
+  INPUT_EXPECTED_SHA256="$(jq -cn --arg d "$(zero_sha256 32)" '{"example-crate": $d}')"
+  export INPUT_EXPECTED_SHA256
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls $'version\nmetadata\nrepackage\ndry-run\nrepackage\npublish'
+  [ "$(output_value crate_sha256)" = "$(zero_sha256 32)" ]
+
+  INPUT_EXPECTED_SHA256="$(jq -cn --arg d "$(zero_sha256 32)" '{"other-crate": $d}')"
+  reset_logs
+  run_action
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"expected_sha256 must name exactly the selected crates: example-crate"* ]]
   assert_calls $'version\nmetadata'
 }
 
@@ -1977,6 +2081,18 @@ staging_entry() {
   [ "$(output_value registry_status)" = \
     '{"zeta":"absent","mid":"absent","alpha":"absent"}' ]
   [[ "$output" == *"Published 3 crates to staging registry"* ]]
+}
+
+@test "a digest map packages a set for the named registry too" {
+  use_staging
+  standard_workspace
+  INPUT_EXPECTED_SHA256="$(digest_map zeta mid alpha)"
+  export INPUT_EXPECTED_SHA256
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls $'version\nmetadata\nrepackage\ndry-run\nrepackage\npublish'
+  [ "$(head -n 1 "$MOCK_CARGO_SETS")" = "repackage zeta mid alpha" ]
 }
 
 @test "a set's upload gets registry_token under the named registry alone" {

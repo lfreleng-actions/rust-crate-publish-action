@@ -60,6 +60,36 @@ set_json_map() {
     --args ${pairs[@]+"${pairs[@]}"}
 }
 
+# expected_sha256 holds a digest map when it opens with '{'.
+expected_is_map() {
+  local trimmed="${expected_sha256#"${expected_sha256%%[![:space:]]*}"}"
+  [[ "$trimmed" == "{"* ]]
+}
+
+# A map must be one JSON object of crate names to lowercase SHA-256
+# digests, without repeated keys, which jq would otherwise collapse
+# silently. Prints the map in compact form.
+parse_digest_map() {
+  local map
+  map="$(jq -ces 'select(length == 1) | .[0]
+    | select(type == "object" and length > 0
+      and all(keys[]; test("^[A-Za-z0-9_-]+$"))
+      and all(.[]; type == "string" and test("^[0-9a-f]{64}$")))' \
+    <<< "$expected_sha256" 2> /dev/null)" || return 1
+  jq -en --stream '[inputs | select(length == 2) | .[0][0]]
+    | length == (unique | length)' <<< "$expected_sha256" \
+    > /dev/null 2>&1 || return 1
+  printf '%s' "$map"
+}
+
+# Check that a digest map names exactly the selected crates.
+require_digest_keys() {
+  if ! jq -e --argjson names "$(json_strings "$@")" \
+    'keys == ($names | sort)' <<< "$expected_sha256" > /dev/null; then
+    fail "expected_sha256 must name exactly the selected crates:" \
+      "$*"
+  fi
+}
 
 # Order a JSON array of {name, deps} so every crate follows the
 # selected crates it depends on. As in Cargo's own upload plan, crates
@@ -266,11 +296,19 @@ publish_crate_set() {
   fi
 
   stage="Package"
-  cargo_with_annotations project_cargo package --locked \
-    ${package_registry[@]+"${package_registry[@]}"} \
-    --target-dir "$package_target" --manifest-path "$manifest_abs" \
-    "${select_args[@]}"
-  verification_cell="✅ Compiled and verified in this job"
+  if [ -n "$expected_sha256" ]; then
+    trusted_cargo package --no-verify --locked \
+      ${package_registry[@]+"${package_registry[@]}"} \
+      --target-dir "$package_target" --manifest-path "$manifest_abs" \
+      "${select_args[@]}"
+    verification_cell="⏸️ Awaiting digest match"
+  else
+    cargo_with_annotations project_cargo package --locked \
+      ${package_registry[@]+"${package_registry[@]}"} \
+      --target-dir "$package_target" --manifest-path "$manifest_abs" \
+      "${select_args[@]}"
+    verification_cell="✅ Compiled and verified in this job"
+  fi
 
   stage="Check package size"
   for i in "${!set_names[@]}"; do
@@ -293,6 +331,24 @@ publish_crate_set() {
         "the $max_bytes-byte limit"
     fi
   done
+
+  if [ -n "$expected_sha256" ]; then
+    stage="Match verified digest"
+    for i in "${!set_names[@]}"; do
+      if [ "${set_digests[i]}" != "$(jq -r --arg n "${set_names[i]}" \
+        '.[$n]' <<< "$expected_sha256")" ]; then
+        verification_cell="❌ $(summary_code "${set_names[i]}") differs"
+        verification_cell+=" from the verified digest"
+        fail "${set_names[i]} package does not match its" \
+          "expected_sha256 entry; not publishing. This job packaged it" \
+          "with cargo $cargo_version; if the verifying job's" \
+          "cargo_version output differs, pin an exact toolchain channel."
+      fi
+    done
+    verification_cell="✅ Matches the digests from an earlier job; not"
+    verification_cell+=" compiled here"
+    echo "Every package matches its expected_sha256 entry ✅"
+  fi
 
   # As for one crate: identical bytes on the registry mean a re-run, so
   # that crate is skipped and the rest resume; different bytes fail a

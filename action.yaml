@@ -71,7 +71,7 @@ inputs:
     default: ""
   expected_sha256:
     # yamllint disable-line rule:line-length
-    description: "crate_sha256 from an earlier dry_run job; skips compilation and uploads only that archive"
+    description: "crate_sha256 from an earlier dry_run job (a JSON object for two or more crates); skips compilation and uploads only those archives"
     required: false
     default: ""
   permit_fail:
