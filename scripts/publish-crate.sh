@@ -169,10 +169,39 @@ finish() {
 }
 trap finish EXIT
 
+# Fill scrub_args with the 'env -u' arguments that withhold, from cargo
+# and rustup, every registry token (CARGO_REGISTRY_TOKEN and each
+# CARGO_REGISTRIES_<NAME>_TOKEN), the variables that mint GitHub OIDC
+# tokens, the runtime token, and the runner's command files. Crate code
+# could otherwise use the files to forge step outputs, environment
+# variables, PATH entries or the job summary for later steps. Other
+# CARGO_REGISTRIES_<NAME>_* settings, such as _INDEX, stay. Names given
+# as arguments are spared, for the upload's own credentials. This is
+# defence in depth only: same-user code can still read an ancestor's
+# environment, and the command files' paths are predictable.
+build_scrub() {
+  local name spared=" $* "
+  scrub_args=()
+  for name in CARGO_REGISTRY_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+    ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_OUTPUT \
+    GITHUB_ENV GITHUB_PATH GITHUB_STATE GITHUB_STEP_SUMMARY; do
+    if [[ "$spared" != *" $name "* ]]; then
+      scrub_args+=(-u "$name")
+    fi
+  done
+  while IFS= read -r name; do
+    case "$name" in
+      CARGO_REGISTRIES_?*_TOKEN)
+        if [[ "$spared" != *" $name "* ]]; then
+          scrub_args+=(-u "$name")
+        fi
+        ;;
+    esac
+  done < <(compgen -e)
+}
+
 # Run cargo from a directory, pinned to the resolved rustup toolchain,
-# with registry tokens and the variables that mint GitHub OIDC tokens
-# withheld. Withholding is defence in depth only: same-user code can
-# still read them from an ancestor process.
+# with the environment scrubbed as build_scrub describes.
 run_cargo_in() {
   local dir="$1"
   shift
@@ -182,9 +211,8 @@ run_cargo_in() {
   fi
   (
     cd -- "$dir"
-    exec env -u CARGO_REGISTRY_TOKEN -u CARGO_REGISTRIES_CRATES_IO_TOKEN \
-      -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL \
-      ${pin[@]+"${pin[@]}"} cargo "$@"
+    build_scrub
+    exec env "${scrub_args[@]}" ${pin[@]+"${pin[@]}"} cargo "$@"
   )
 }
 
@@ -226,7 +254,8 @@ cargo_with_annotations() {
 # explicit token also forces Cargo's built-in provider: a project
 # .cargo/config.toml could otherwise name a credential provider, which
 # Cargo would run with the token in its environment. Environment
-# settings outrank config files.
+# settings outrank config files. The upload gets the same scrub as
+# every other stage, sparing only crates.io's token variables.
 publishing_cargo() {
   local -a pin=()
   if [ -n "$toolchain_pin" ]; then
@@ -234,16 +263,15 @@ publishing_cargo() {
   fi
   (
     cd -- "$trusted_dir"
+    build_scrub CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
     if [ -n "$registry_token" ]; then
       CARGO_REGISTRY_TOKEN="$registry_token" \
         CARGO_REGISTRY_CREDENTIAL_PROVIDER=cargo:token \
         CARGO_REGISTRIES_CRATES_IO_CREDENTIAL_PROVIDER=cargo:token \
         CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS=cargo:token \
-        exec env -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
-        -u ACTIONS_ID_TOKEN_REQUEST_URL ${pin[@]+"${pin[@]}"} cargo "$@"
+        exec env "${scrub_args[@]}" ${pin[@]+"${pin[@]}"} cargo "$@"
     fi
-    exec env -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
-      -u ACTIONS_ID_TOKEN_REQUEST_URL ${pin[@]+"${pin[@]}"} cargo "$@"
+    exec env "${scrub_args[@]}" ${pin[@]+"${pin[@]}"} cargo "$@"
   )
 }
 
@@ -467,8 +495,9 @@ fi
 # for every stage; a path toolchain is never used for an upload.
 stage="Check toolchain"
 if command -v rustup > /dev/null 2>&1; then
+  build_scrub
   if ! toolchain="$(cd -- "$project_dir" \
-    && rustup show active-toolchain 2> /dev/null)"; then
+    && env "${scrub_args[@]}" rustup show active-toolchain 2> /dev/null)"; then
     fail "could not determine the Rust toolchain rustup selects for" \
       "path_prefix"
   fi

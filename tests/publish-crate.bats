@@ -40,25 +40,35 @@ setup() {
   export MOCK_CARGO_LOG="$workdir/cargo calls"
   export MOCK_CARGO_ENV="$workdir/cargo env"
   export MOCK_CARGO_TARGETS="$workdir/cargo targets"
+  export MOCK_CARGO_VARS="$workdir/cargo vars"
   export MOCK_RUSTUP_LOG="$workdir/rustup calls"
+  export MOCK_RUSTUP_VARS="$workdir/rustup vars"
   export MOCK_CURL_LOG="$workdir/curl calls"
   export MOCK_MANIFEST_JSON="$workdir/manifest.json"
   cp "$BATS_TEST_DIRNAME/fixtures/manifest.json" "$MOCK_MANIFEST_JSON"
   export MOCK_CRATE_SIZE=32
   unset INPUT_MANIFEST_PATH INPUT_RELEASE_TAG INPUT_MAX_CRATE_SIZE_BYTES
   unset INPUT_DRY_RUN INPUT_PERMIT_FAIL INPUT_SUMMARY INPUT_REGISTRY_TOKEN
-  unset INPUT_EXPECTED_SHA256 CARGO_REGISTRY_CREDENTIAL_PROVIDER
+  unset INPUT_EXPECTED_SHA256
   unset MOCK_FAIL_STAGE MOCK_MISSING_PACKAGE MOCK_TAMPER MOCK_TOOLCHAIN
   unset MOCK_INCLUDE_OTHER_PACKAGE MOCK_CARGO_WARNING MOCK_CARGO_VERSION
   unset MOCK_RUSTUP_FAIL MOCK_CURL_FAIL MOCK_INDEX_STATUS MOCK_INDEX_BODY
   unset MOCK_INDEX_STATUS_2 MOCK_INDEX_BODY_2 CARGO_TARGET_DIR
-  unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
   unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
+  unset ACTIONS_RUNTIME_TOKEN GITHUB_ENV GITHUB_PATH GITHUB_STATE
   unset GITHUB_REPOSITORY GITHUB_WORKFLOW_REF RUSTUP_TOOLCHAIN
+  # Host registry settings would reach the stand-ins and break the exact
+  # scrub assertions.
+  local name
+  for name in $(compgen -e); do
+    case "$name" in
+      CARGO_REGISTRY_* | CARGO_REGISTRIES_*) unset "$name" ;;
+    esac
+  done
   local file
   for file in "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY" "$MOCK_CARGO_LOG" \
     "$MOCK_CARGO_ENV" "$MOCK_CARGO_TARGETS" "$MOCK_RUSTUP_LOG" \
-    "$MOCK_CURL_LOG"; do
+    "$MOCK_CURL_LOG" "$MOCK_CARGO_VARS" "$MOCK_RUSTUP_VARS"; do
     : > "$file"
   done
 }
@@ -90,6 +100,12 @@ reset_logs() {
 stage_env() {
   awk -F'|' -v stage="$1" -v field="$2" \
     '$1 == stage { print $field }' "$MOCK_CARGO_ENV"
+}
+
+# The scrub-relevant NAME=value pairs a cargo stage could see, sorted
+# and space-separated.
+stage_vars() {
+  sed -n "s/^$1|//p" "$MOCK_CARGO_VARS"
 }
 
 output_value() {
@@ -944,6 +960,42 @@ readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
   for stage in version metadata package dry-run repackage publish; do
     [ "$(stage_env "$stage" 5)" = unset ]
   done
+}
+
+# Every value differs, so a variable that slips through shows exactly.
+export_scrubbed_variables() {
+  export CARGO_REGISTRY_TOKEN=registry-token
+  export CARGO_REGISTRIES_CRATES_IO_TOKEN=crates-io-token
+  export CARGO_REGISTRIES_PRIVATE_TOKEN=private-token
+  export CARGO_REGISTRIES_PRIVATE_INDEX=sparse+https://private.example/
+  export ACTIONS_ID_TOKEN_REQUEST_TOKEN=oidc-token
+  export ACTIONS_ID_TOKEN_REQUEST_URL=https://oidc.example/
+  export ACTIONS_RUNTIME_TOKEN=runtime-token
+  export GITHUB_ENV="$workdir/env file" GITHUB_PATH="$workdir/path file"
+  export GITHUB_STATE="$workdir/state file"
+}
+
+@test "withholds every token and runner command file from cargo and rustup" {
+  export_scrubbed_variables
+  run_action
+
+  [ "$status" -eq 0 ]
+  local stage kept="CARGO_REGISTRIES_PRIVATE_INDEX=sparse+https://private.example/ "
+  for stage in version metadata package dry-run repackage; do
+    [ "$(stage_vars "$stage")" = "$kept" ]
+  done
+  [ "$(cat "$MOCK_RUSTUP_VARS")" = "$kept" ]
+  # The action's own writes still land.
+  [ "$(output_value publish_status)" = published ]
+  [ -s "$GITHUB_STEP_SUMMARY" ]
+}
+
+@test "the upload sees crates.io's token variables and nothing else scrubbed" {
+  export_scrubbed_variables
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(stage_vars publish)" = "CARGO_REGISTRIES_CRATES_IO_TOKEN=crates-io-token CARGO_REGISTRIES_PRIVATE_INDEX=sparse+https://private.example/ CARGO_REGISTRY_TOKEN=registry-token " ]
 }
 
 @test "leaves Cargo credential files untouched" {

@@ -57,6 +57,15 @@ printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$stage" "$(pwd -P)" \
   "${INPUT_REGISTRY_TOKEN-unset}" \
   "${CARGO_REGISTRY_CREDENTIAL_PROVIDER-unset}" \
   "${RUSTUP_TOOLCHAIN-unset}" >> "$MOCK_CARGO_ENV"
+# Every registry, GitHub token or runner command file variable this
+# stage can see, as sorted NAME=value pairs, for the scrub tests. Runners
+# set other ACTIONS_* variables the action has no reason to withhold.
+{
+  printf '%s|' "$stage"
+  env | grep -E '^(CARGO_REGISTRY_[A-Z_]+|CARGO_REGISTRIES_[A-Z0-9_]+|ACTIONS_(ID_TOKEN_REQUEST_(TOKEN|URL)|RUNTIME_TOKEN)|GITHUB_(OUTPUT|ENV|PATH|STATE|STEP_SUMMARY))=' \
+    | LC_ALL=C sort | tr '\n' ' ' || true
+  echo
+} >> "$MOCK_CARGO_VARS"
 
 [ "$#" -eq "${#expected[@]}" ] || exit 91
 target=""

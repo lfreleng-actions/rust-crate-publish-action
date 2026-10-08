@@ -335,9 +335,18 @@ depth rather than isolation:
 
 - `registry_token` goes to the final upload alone; the action unsets
   it before running Cargo and masks it in the log.
-- It strips `CARGO_REGISTRY_TOKEN`, `CARGO_REGISTRIES_CRATES_IO_TOKEN`
-  and the GitHub OIDC request variables (`ACTIONS_ID_TOKEN_REQUEST_*`)
-  from every Cargo stage before the upload.
+- It runs every Cargo stage before the upload, and `rustup`, without
+  `CARGO_REGISTRY_TOKEN`, any `CARGO_REGISTRIES_<NAME>_TOKEN`, the
+  GitHub OIDC request variables (`ACTIONS_ID_TOKEN_REQUEST_*`),
+  `ACTIONS_RUNTIME_TOKEN`, or the runner's command files
+  (`GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STATE`,
+  `GITHUB_STEP_SUMMARY`). Crate code could otherwise use those files to
+  forge step outputs, environment variables, `PATH` entries or the job
+  summary. Their paths are predictable, so this hinders rather than
+  prevents it. Other registry settings, such as
+  `CARGO_REGISTRIES_<NAME>_INDEX`, stay.
+- The upload gets the same scrub, except that it keeps the token
+  variables of the registry it targets.
 - The upload passes `--no-verify`, so it compiles nothing.
 
 With `registry_token` set, the upload also forces Cargo's built-in
