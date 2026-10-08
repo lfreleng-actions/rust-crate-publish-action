@@ -393,6 +393,9 @@ publish_crate_set() {
     return 0
   fi
 
+  # Opt-in, and only in a dry run, which keeps every crate above.
+  semver_check_set
+
   stage="Dry-run publish"
   cargo_with_annotations trusted_cargo publish --dry-run --no-verify --locked \
     --registry "$publish_registry" --target-dir "$package_target" \
