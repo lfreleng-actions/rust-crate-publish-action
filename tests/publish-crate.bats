@@ -41,6 +41,7 @@ setup() {
   export MOCK_CARGO_ENV="$workdir/cargo env"
   export MOCK_CARGO_TARGETS="$workdir/cargo targets"
   export MOCK_CARGO_VARS="$workdir/cargo vars"
+  export MOCK_CARGO_SETS="$workdir/cargo sets"
   export MOCK_RUSTUP_LOG="$workdir/rustup calls"
   export MOCK_RUSTUP_VARS="$workdir/rustup vars"
   export MOCK_CURL_LOG="$workdir/curl calls"
@@ -59,6 +60,9 @@ setup() {
   unset INPUT_REGISTRY MOCK_EXPECT_REGISTRY MOCK_CONFIG_STATUS
   unset MOCK_CONFIG_BODY MOCK_DRY_RUN_EXISTS
   unset GITHUB_REPOSITORY GITHUB_WORKFLOW_REF RUSTUP_TOOLCHAIN
+  unset INPUT_WORKSPACE INPUT_PACKAGES INPUT_EXCLUDE MOCK_WORKSPACE_JSON
+  unset MOCK_EXPECT_PACKAGE_MANIFEST MOCK_INDEX_DIR MOCK_PUBLISH_FAIL_AT
+  unset MOCK_RACE_CKSUM MOCK_INDEX_DIR_MISSING
   # Host registry settings would reach the stand-ins and break the exact
   # scrub assertions.
   local name
@@ -70,7 +74,8 @@ setup() {
   local file
   for file in "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY" "$MOCK_CARGO_LOG" \
     "$MOCK_CARGO_ENV" "$MOCK_CARGO_TARGETS" "$MOCK_RUSTUP_LOG" \
-    "$MOCK_CURL_LOG" "$MOCK_CARGO_VARS" "$MOCK_RUSTUP_VARS"; do
+    "$MOCK_CURL_LOG" "$MOCK_CARGO_VARS" "$MOCK_RUSTUP_VARS" \
+    "$MOCK_CARGO_SETS"; do
     : > "$file"
   done
 }
@@ -91,6 +96,7 @@ assert_no_cargo() {
 reset_logs() {
   : > "$MOCK_CARGO_LOG"
   : > "$MOCK_CARGO_ENV"
+  : > "$MOCK_CARGO_SETS"
   : > "$GITHUB_OUTPUT"
   : > "$GITHUB_STEP_SUMMARY"
 }
@@ -132,6 +138,81 @@ index_entry() {
 
 readonly publish_calls=$'version\nmetadata\npackage\ndry-run\nrepackage\npublish'
 readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
+
+# Describe a workspace below the project directory to the cargo
+# stand-in. Each argument is NAME:VERSION:DEPS:PUBLISH. DEPS is a comma
+# list of members, each optionally suffixed '@build', '@dev' (without a
+# version, as Cargo strips on publishing), '@devv' (versioned dev),
+# '@ext' (a registry crate of that name, not the member) or '@out' (a
+# path crate of that name outside the workspace). PUBLISH is
+# empty (any registry), 'false', or a comma list of registries.
+make_workspace() {
+  local spec name version deps publish entries="[]"
+  export MOCK_WORKSPACE_JSON="$workdir/workspace.json"
+  export MOCK_INDEX_DIR="$workdir/index"
+  mkdir -p "$MOCK_INDEX_DIR"
+  for spec in "$@"; do
+    IFS=: read -r name version deps publish <<< "$spec"
+    mkdir -p "$project/crates/$name"
+    : > "$project/crates/$name/Cargo.toml"
+    entries="$(jq -c --arg n "$name" --arg v "$version" \
+      --arg m "$project/crates/$name/Cargo.toml" --arg deps "$deps" \
+      --arg pub "$publish" --arg root "$project/crates" '. + [{
+        id: ("path+file://" + $m + "#" + $n + "@" + $v),
+        name: $n, version: $v, manifest_path: $m,
+        publish: (if $pub == "" then null elif $pub == "false" then []
+                  else ($pub | split(",")) end),
+        dependencies: [$deps | select(length > 0) | split(",")[]
+          | split("@") as [$d, $k]
+          | {name: $d,
+             kind: (if $k == null or $k == "ext" or $k == "out" then null
+                    elif $k == "devv" then "dev" else $k end),
+             req: (if $k == "dev" then "*" else "^1" end),
+             path: (if $k == "ext" then null
+                    elif $k == "out" then $root + "/../vendor/" + $d
+                    else $root + "/" + $d end)}]}]' \
+      <<< "$entries")"
+  done
+  printf '%s\n' "$entries" > "$MOCK_WORKSPACE_JSON"
+}
+
+# zeta <- mid <- alpha, so dependency order is the reverse of
+# alphabetical; internal and private are not for crates.io.
+standard_workspace() {
+  make_workspace alpha:1.0.0:mid mid:1.0.0:zeta zeta:1.0.0:serde@ext \
+    internal:1.0.0::false private:1.0.0::other
+  export INPUT_WORKSPACE=true
+}
+
+# SHA-256 of the archive the cargo stand-in packages for NAME in a set.
+set_sha256() {
+  { printf '%s' "$1"; head -c "$MOCK_CRATE_SIZE" /dev/zero; } > "$workdir/archive"
+  if command -v sha256sum > /dev/null 2>&1; then
+    sha256sum < "$workdir/archive" | cut -d' ' -f1
+  else
+    shasum -a 256 < "$workdir/archive" | cut -d' ' -f1
+  fi
+}
+
+# JSON digest map for the named crates, in the order given.
+digest_map() {
+  local name pairs=()
+  for name in "$@"; do
+    pairs+=("$name" "$(set_sha256 "$name")")
+  done
+  jq -cn '$ARGS.positional as $a | reduce range(0; $a | length; 2) as $i
+    ({}; . + {($a[$i]): $a[$i + 1]})' --args "${pairs[@]}"
+}
+
+# Record NAME 1.0.0 in the stand-in index with DIGEST.
+published_entry() {
+  printf '{"name":"%s","vers":"1.0.0","cksum":"%s"}\n' "$1" "$2" \
+    > "$MOCK_INDEX_DIR/$1"
+}
+
+last_output_value() {
+  output_value "$1" | tail -n 1
+}
 
 ### Default flow ###
 
@@ -1502,6 +1583,574 @@ MARKDOWN
   run ! grep -iq 'auth\|token' "$GITHUB_STEP_SUMMARY"
 }
 
+### Workspace selection ###
+
+@test "workspace publishes every crates.io member as one set in dependency order" {
+  standard_workspace
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls "$publish_calls"
+  [ "$(cat "$MOCK_CARGO_SETS")" = "$(printf '%s\n' \
+    'package zeta mid alpha' 'dry-run zeta mid alpha' \
+    'repackage zeta mid alpha' 'publish zeta mid alpha')" ]
+  [ "$(cat "$GITHUB_OUTPUT")" = "$(printf '%s\n' cargo_version=1.98.1 \
+    'crate_name=zeta mid alpha' \
+    'crate_version={"zeta":"1.0.0","mid":"1.0.0","alpha":"1.0.0"}' \
+    'crate_size_bytes={"zeta":36,"mid":35,"alpha":37}' \
+    "crate_sha256=$(digest_map zeta mid alpha)" \
+    'registry_status={"zeta":"absent","mid":"absent","alpha":"absent"}' \
+    published=true publish_status=published)" ]
+  [[ "$output" == *"::notice::Skipping workspace members whose package.publish setting excludes crates.io: internal, private"* ]]
+  [ "$(cat "$MOCK_CURL_LOG")" = "$(printf '%s\n' \
+    https://index.crates.io/ze/ta/zeta https://index.crates.io/3/m/mid \
+    https://index.crates.io/al/ph/alpha)" ]
+  [ "$(stage_env package 2)" = "$project" ]
+}
+
+@test "orders by normal, build and versioned dev dependencies only" {
+  make_workspace a:1.0.0:b@build b:1.0.0:c@devv c:1.0.0:d@dev d:1.0.0:a@ext
+  export INPUT_WORKSPACE=true INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(head -n 1 "$MOCK_CARGO_SETS")" = "package c d b a" ]
+  [ "$(output_value crate_name)" = "c d b a" ]
+}
+
+@test "a path crate outside the workspace is no member edge" {
+  make_workspace a:1.0.0:b@out b:1.0.0:a
+  export INPUT_WORKSPACE=true INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(output_value crate_name)" = "a b" ]
+}
+
+# A version-only dependency that [patch.crates-io] points at a member
+# carries no path, as '@ext' models. Cargo 1.99 packages and uploads
+# such a dependent first, against the crates.io release, so the reported
+# order must follow suit rather than put the member first.
+@test "a version-only dependency patched to a member is no member edge" {
+  make_workspace app:1.0.0:core@ext core:1.0.0:
+  export INPUT_WORKSPACE=true INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(head -n 1 "$MOCK_CARGO_SETS")" = "package app core" ]
+  [ "$(output_value crate_name)" = "app core" ]
+}
+
+@test "refuses selected crates that depend on each other in a cycle" {
+  make_workspace a:1.0.0:b b:1.0.0:a@devv
+  export INPUT_WORKSPACE=true
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"the selected crates depend on each other in a cycle"* ]]
+  assert_calls $'version\nmetadata'
+}
+
+@test "exclude leaves members out of the workspace selection" {
+  standard_workspace
+  export INPUT_EXCLUDE="alpha" INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(output_value crate_name)" = "zeta mid" ]
+  [ "$(head -n 1 "$MOCK_CARGO_SETS")" = "package zeta mid" ]
+}
+
+@test "exclude warns about a name the workspace does not hold" {
+  standard_workspace
+  export INPUT_EXCLUDE="nonesuch" INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"::warning::exclude names nonesuch, which is not a member of this workspace"* ]]
+}
+
+@test "packages selects the named members, ordered by their dependencies" {
+  standard_workspace
+  export INPUT_WORKSPACE=false INPUT_PACKAGES=$'alpha\n  mid' INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MOCK_CARGO_SETS")" = "$(printf '%s\n' 'package mid alpha' \
+    'dry-run mid alpha' 'repackage mid alpha')" ]
+  [ "$(output_value crate_name)" = "mid alpha" ]
+  [ "$(output_value publish_status)" = dry-run ]
+}
+
+@test "packages replaces workspace" {
+  standard_workspace
+  export INPUT_PACKAGES="mid zeta" INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(output_value crate_name)" = "zeta mid" ]
+}
+
+@test "one selected crate takes the single-crate path with its manifest" {
+  standard_workspace
+  export INPUT_PACKAGES=mid MOCK_EXPECT_PACKAGE_MANIFEST="$project/crates/mid/Cargo.toml"
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls "$publish_calls"
+  [ ! -s "$MOCK_CARGO_SETS" ]
+  [ "$(cat "$GITHUB_OUTPUT")" = "$(printf '%s\n' cargo_version=1.98.1 \
+    crate_name=mid crate_version=1.0.0 crate_size_bytes=32 \
+    "crate_sha256=$(zero_sha256 32)" registry_status=absent \
+    published=true publish_status=published)" ]
+  grep -Fq '| Manifest | <code>member crate/crates/mid/Cargo.toml</code> |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "a workspace with one crates.io member publishes it as a single crate" {
+  make_workspace solo:2.0.0: hidden:1.0.0::false
+  export INPUT_WORKSPACE=true MOCK_EXPECT_PACKAGE_MANIFEST="$project/crates/solo/Cargo.toml"
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(output_value crate_name)" = solo ]
+  [ "$(output_value crate_sha256)" = "$(zero_sha256 32)" ]
+}
+
+@test "packages must name workspace members crates.io accepts" {
+  standard_workspace
+  local name
+  for name in nonesuch internal private; do
+    export INPUT_PACKAGES="zeta $name"
+    reset_logs
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"::error::packages names $name, "* ]]
+    assert_calls $'version\nmetadata'
+  done
+}
+
+@test "fails when the workspace holds nothing for crates.io" {
+  make_workspace internal:1.0.0::false private:1.0.0::other
+  export INPUT_WORKSPACE=true
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"the selection holds no crate that can be published to crates.io"* ]]
+}
+
+@test "rejects invalid selection inputs before running cargo" {
+  local -a cases=(
+    "INPUT_WORKSPACE=yes|workspace must be 'true' or 'false'"
+    "INPUT_PACKAGES=a,b|packages must list crate names"
+    "INPUT_PACKAGES=a\$(id)|packages must list crate names"
+    "INPUT_EXCLUDE=a/b|exclude must list crate names"
+    "INPUT_EXCLUDE=a|exclude needs workspace set to 'true'"
+  )
+  local entry
+  for entry in "${cases[@]}"; do
+    unset INPUT_WORKSPACE INPUT_PACKAGES INPUT_EXCLUDE
+    export "${entry%%|*}"
+    reset_logs
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"::error::${entry#*|}"* ]]
+    assert_no_cargo
+  done
+  export INPUT_WORKSPACE=true INPUT_PACKAGES=a INPUT_EXCLUDE=b
+  run_action
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::exclude cannot be combined with packages"* ]]
+}
+
+@test "publishing a set needs Cargo 1.90; one crate does not" {
+  standard_workspace
+  export MOCK_CARGO_VERSION=1.89.0
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"publishing several crates needs Cargo 1.90 or later"* ]]
+  assert_calls $'version\nmetadata'
+
+  export INPUT_PACKAGES=zeta MOCK_EXPECT_PACKAGE_MANIFEST="$project/crates/zeta/Cargo.toml"
+  unset INPUT_WORKSPACE
+  reset_logs
+  run_action
+  [ "$status" -eq 0 ]
+}
+
+@test "release_tag must match every selected crate" {
+  make_workspace a:1.0.0: b:1.1.0:a
+  export INPUT_WORKSPACE=true INPUT_RELEASE_TAG=v1.0.0
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"b Cargo.toml version (1.1.0) does not match release tag (1.0.0)"* ]]
+  assert_calls $'version\nmetadata'
+
+  make_workspace a:1.1.0: b:1.1.0:a
+  export INPUT_RELEASE_TAG=1.1.0 INPUT_DRY_RUN=true
+  reset_logs
+  run_action
+  [ "$status" -eq 0 ]
+  grep -Fq '| Release tag | ✅ <code>1.1.0</code> matches all 2 crates |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "enforces the size limit on every crate of a set" {
+  standard_workspace
+  export INPUT_MAX_CRATE_SIZE_BYTES=36
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"alpha package is 37 bytes, exceeding the 36-byte limit"* ]]
+  assert_calls $'version\nmetadata\npackage'
+}
+
+@test "refuses a set whose member changed after verification" {
+  standard_workspace
+  export MOCK_TAMPER=mid
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"mid package changed after verification; not publishing"* ]]
+  assert_calls "$dry_run_calls"
+}
+
+@test "fails when Cargo leaves out a member's archive" {
+  standard_workspace
+  export MOCK_MISSING_PACKAGE=mid
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"cargo package did not produce mid-1.0.0.crate"* ]]
+}
+
+### Workspace digests ###
+
+@test "a single digest cannot cover several crates" {
+  standard_workspace
+  INPUT_EXPECTED_SHA256="$(zero_sha256 32)"
+  export INPUT_EXPECTED_SHA256
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"expected_sha256 holds one digest, but 3 crates are selected"* ]]
+  assert_calls $'version\nmetadata'
+}
+
+### Workspace re-runs and partial failure ###
+
+@test "a re-run skips members already published and uploads the rest" {
+  standard_workspace
+  published_entry zeta "$(set_sha256 zeta)"
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MOCK_CARGO_SETS")" = "$(printf '%s\n' \
+    'package zeta mid alpha' 'dry-run mid alpha' \
+    'repackage zeta mid alpha' 'publish mid alpha')" ]
+  [ "$(output_value registry_status)" = \
+    '{"zeta":"identical","mid":"absent","alpha":"absent"}' ]
+  [ "$(output_value publish_status)" = published ]
+  grep -Fq '| <code>zeta 1.0.0</code> | ⛔️ Skipped: identical archive already on crates.io;' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "a set already published in full is skipped without an upload" {
+  standard_workspace
+  local name
+  for name in zeta mid alpha; do
+    published_entry "$name" "$(set_sha256 "$name")"
+  done
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls $'version\nmetadata\npackage'
+  [ "$(output_value published)" = false ]
+  [ "$(output_value publish_status)" = skipped ]
+  grep -Fq '### ⛔️ Skipped: previously published: 3 crates' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "one member with different published content stops the release" {
+  standard_workspace
+  published_entry mid "$(zero_sha256 1)"
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"mid 1.0.0 is already on crates.io with different content"* ]]
+  assert_calls $'version\nmetadata\npackage'
+  [ "$(output_value registry_status)" = '{"zeta":"absent","mid":"different"}' ]
+
+  export INPUT_DRY_RUN=true
+  reset_logs
+  run_action
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"::warning::mid 1.0.0 is already on crates.io with different content"* ]]
+}
+
+@test "a failed upload records what reached crates.io, and a re-run resumes" {
+  standard_workspace
+  export MOCK_PUBLISH_FAIL_AT=alpha
+  run_action
+
+  [ "$status" -eq 43 ]
+  [ "$(output_value published)" = true ]
+  [ "$(output_value publish_status)" = failed ]
+  [ "$(last_output_value registry_status)" = \
+    '{"zeta":"identical","mid":"identical","alpha":"absent"}' ]
+  [[ "$output" == *"after uploading 2 of 3 crates. A re-run skips the uploaded ones and resumes."* ]]
+  grep -Fq '| <code>mid 1.0.0</code> | 🚀 Published;' "$GITHUB_STEP_SUMMARY"
+  grep -Fq '| <code>alpha 1.0.0</code> | ❌ Not published;' "$GITHUB_STEP_SUMMARY"
+
+  unset MOCK_PUBLISH_FAIL_AT
+  reset_logs
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(tail -n 1 "$MOCK_CARGO_SETS")" = "publish alpha" ]
+  [ "$(output_value registry_status)" = \
+    '{"zeta":"identical","mid":"identical","alpha":"absent"}' ]
+  [ "$(output_value publish_status)" = published ]
+}
+
+@test "a failed upload reports other content that reached crates.io first" {
+  standard_workspace
+  MOCK_RACE_CKSUM="$(zero_sha256 1)"
+  export MOCK_PUBLISH_FAIL_AT=alpha MOCK_RACE_CKSUM
+  run_action
+
+  [ "$status" -eq 43 ]
+  [ "$(last_output_value registry_status)" = \
+    '{"zeta":"identical","mid":"identical","alpha":"different"}' ]
+  [[ "$output" == *"after uploading 2 of 3 crates."* ]]
+  grep -Fq '| <code>alpha 1.0.0</code> | ❌ Not published; 37 B; ⚠️ crates.io holds different content;' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "permit_fail covers a failed set upload" {
+  standard_workspace
+  export MOCK_PUBLISH_FAIL_AT=zeta INPUT_PERMIT_FAIL=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(output_value publish_status)" = failed ]
+  [ "$(output_value published)" = false ]
+}
+
+@test "only the set upload sees registry_token" {
+  standard_workspace
+  export INPUT_REGISTRY_TOKEN=secret-token CARGO_REGISTRY_TOKEN=ambient
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(stage_env publish 3)" = secret-token ]
+  local stage
+  for stage in version metadata package dry-run repackage; do
+    [ "$(stage_env "$stage" 3)" = unset ]
+  done
+  [[ "$output" == *"Trusted Publisher config surface for zeta mid alpha"* ]]
+}
+
+### Workspace on a named registry ###
+
+# The staging index URL of a crate, as lookup_registry builds it.
+staging_entry() {
+  printf 'https://index.staging.example/%s\n' "$@"
+}
+
+@test "a set on a named registry passes --registry to every Cargo call" {
+  use_staging
+  standard_workspace
+  run_action
+
+  [ "$status" -eq 0 ]
+  # The cargo stand-in rejects any call without '--registry staging'.
+  assert_calls "$publish_calls"
+  [ "$(cat "$MOCK_CARGO_SETS")" = "$(printf '%s\n' \
+    'package zeta mid alpha' 'dry-run zeta mid alpha' \
+    'repackage zeta mid alpha' 'publish zeta mid alpha')" ]
+  [ "$(cat "$MOCK_CURL_LOG")" = "$(staging_entry config.json \
+    ze/ta/zeta 3/m/mid al/ph/alpha)" ]
+  [ "$(output_value registry_status)" = \
+    '{"zeta":"absent","mid":"absent","alpha":"absent"}' ]
+  [[ "$output" == *"Published 3 crates to staging registry"* ]]
+}
+
+@test "a set's upload gets registry_token under the named registry alone" {
+  use_staging
+  standard_workspace
+  export INPUT_REGISTRY_TOKEN=input-token CARGO_REGISTRY_TOKEN=crates-io-token
+  run_action
+
+  [ "$status" -eq 0 ]
+  local stage
+  for stage in version metadata package dry-run repackage; do
+    [ "$(stage_vars "$stage")" = "$staging_vars" ]
+  done
+  [ "$(stage_vars publish)" = "CARGO_REGISTRIES_STAGING_CREDENTIAL_PROVIDER=cargo:token ${staging_vars}CARGO_REGISTRIES_STAGING_TOKEN=input-token CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS=cargo:token " ]
+}
+
+@test "a set's upload keeps the caller's token for the named registry alone" {
+  use_staging
+  standard_workspace
+  export_scrubbed_variables
+  export CARGO_REGISTRIES_STAGING_TOKEN=staging-token
+  run_action
+
+  [ "$status" -eq 0 ]
+  local stage
+  local kept="CARGO_REGISTRIES_PRIVATE_INDEX=sparse+https://private.example/ $staging_vars"
+  for stage in version metadata package dry-run repackage; do
+    [ "$(stage_vars "$stage")" = "$kept" ]
+  done
+  [ "$(stage_vars publish)" = "${kept}CARGO_REGISTRIES_STAGING_TOKEN=staging-token " ]
+}
+
+# Measured on cargo 1.99: metadata reports each package.publish list
+# verbatim, and Cargo matches the --registry name against it exactly.
+@test "a set keeps the members whose publish list names the registry" {
+  make_workspace a:1.0.0::staging b:1.0.0::crates-io c:1.0.0: \
+    d:1.0.0::false e:1.0.0::crates-io,staging f:1.0.0::Staging
+  export INPUT_WORKSPACE=true INPUT_DRY_RUN=true
+  use_staging
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(output_value crate_name)" = "a c e" ]
+  [[ "$output" == *"::notice::Skipping workspace members whose package.publish setting excludes staging registry: b, d, f"* ]]
+
+  unset INPUT_REGISTRY MOCK_EXPECT_REGISTRY
+  reset_logs
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(output_value crate_name)" = "b c e" ]
+  [[ "$output" == *"excludes crates.io: a, d, f"* ]]
+}
+
+@test "packages refuses a member whose publish list omits the registry" {
+  make_workspace a:1.0.0::staging b:1.0.0::crates-io
+  export INPUT_PACKAGES="a b"
+  use_staging
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"packages names b, whose package.publish setting excludes staging registry"* ]]
+  assert_calls $'version\nmetadata'
+}
+
+@test "a hyphenated registry name must match the publish list exactly" {
+  make_workspace a:1.0.0::my-registry b:1.0.0::my_registry c:1.0.0:
+  export INPUT_WORKSPACE=true INPUT_DRY_RUN=true
+  export INPUT_REGISTRY=my-registry MOCK_EXPECT_REGISTRY=my-registry
+  export CARGO_REGISTRIES_MY_REGISTRY_INDEX="$staging_index"
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(output_value crate_name)" = "a c" ]
+  [[ "$output" == *"excludes my-registry registry: b"* ]]
+}
+
+@test "a failed set upload re-checks the named registry's index" {
+  use_staging
+  standard_workspace
+  export MOCK_PUBLISH_FAIL_AT=alpha
+  run_action
+
+  [ "$status" -eq 43 ]
+  [ "$(output_value published)" = true ]
+  [ "$(last_output_value registry_status)" = \
+    '{"zeta":"identical","mid":"identical","alpha":"absent"}' ]
+  [ "$(cat "$MOCK_CURL_LOG")" = "$(staging_entry config.json \
+    ze/ta/zeta 3/m/mid al/ph/alpha ze/ta/zeta 3/m/mid al/ph/alpha)" ]
+  grep -Fq '| <code>mid 1.0.0</code> | 🚀 Published;' "$GITHUB_STEP_SUMMARY"
+  run ! grep -q 'https://crates.io/crates/' "$GITHUB_STEP_SUMMARY"
+
+  unset MOCK_PUBLISH_FAIL_AT
+  reset_logs
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(tail -n 1 "$MOCK_CARGO_SETS")" = "publish alpha" ]
+  [[ "$output" == *"zeta 1.0.0 is already on staging registry with identical content; skipping its upload"* ]]
+  grep -Fq '| <code>zeta 1.0.0</code> | ⛔️ Skipped: identical archive already on staging registry;' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "a named registry may answer 410 or 451 for absent set members" {
+  local code
+  for code in 410 451; do
+    use_staging
+    standard_workspace
+    export MOCK_INDEX_DIR_MISSING="$code" INPUT_DRY_RUN=true
+    reset_logs
+    run_action
+
+    [ "$status" -eq 0 ]
+    [ "$(output_value registry_status)" = \
+      '{"zeta":"absent","mid":"absent","alpha":"absent"}' ]
+
+    unset INPUT_REGISTRY MOCK_EXPECT_REGISTRY
+    reset_logs
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"the crates.io index answered HTTP $code for zeta"* ]]
+  done
+}
+
+@test "different content on a named registry fails a set release" {
+  use_staging
+  standard_workspace
+  published_entry mid "$(zero_sha256 1)"
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"mid 1.0.0 is already on staging registry with different content"* ]]
+  [[ "$output" == *"Cargo will not publish a version the registry already holds"* ]]
+  assert_calls $'version\nmetadata\npackage'
+}
+
+### Workspace job summary ###
+
+@test "a set's summary has one row per crate" {
+  standard_workspace
+  export INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  grep -Fq '### ✅ Dry run passed: 3 crates' "$GITHUB_STEP_SUMMARY"
+  grep -Fq '| Not publishable | internal, private |' "$GITHUB_STEP_SUMMARY"
+  grep -Fqx "| <code>zeta 1.0.0</code> | ✅ Dry run passed; 36 B; not yet on crates.io; <code>$(set_sha256 zeta)</code> |" \
+    "$GITHUB_STEP_SUMMARY"
+  [ "$(grep -c '^| <code>' "$GITHUB_STEP_SUMMARY")" -eq 3 ]
+  run ! grep -q '| Package size |' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "a dry run row notes an identical archive already on crates.io" {
+  standard_workspace
+  published_entry zeta "$(set_sha256 zeta)"
+  export INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  grep -Fqx "| <code>zeta 1.0.0</code> | ✅ Dry run passed; 36 B; already on crates.io, identical archive; <code>$(set_sha256 zeta)</code> |" \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "a published set links every crate" {
+  standard_workspace
+  run_action
+
+  [ "$status" -eq 0 ]
+  grep -Fq '### 🚀 Published: 3 crates' "$GITHUB_STEP_SUMMARY"
+  grep -Fqx "| <code>alpha 1.0.0</code> | 🚀 Published; 37 B; <code>$(set_sha256 alpha)</code>; 🔗 https://crates.io/crates/alpha/1.0.0 |" \
+    "$GITHUB_STEP_SUMMARY"
+}
+
 ### Action wiring ###
 
 @test "action.yaml runs the script and passes exactly the inputs it reads" {
@@ -1512,7 +2161,8 @@ MARKDOWN
   declared="$(sed -n '/^inputs:/,/^outputs:/s/^  \([a-z0-9_]*\):$/\1/p' \
     "$action_file" | tr '[:lower:]' '[:upper:]' | sed 's/^/INPUT_/' | sort)"
   passed="$(sed -n 's/^ *\(INPUT_[A-Z0-9_]*\): .*/\1/p' "$action_file" | sort)"
-  consumed="$(grep -o 'INPUT_[A-Z][A-Z0-9_]*' "$script" | sort -u)"
+  consumed="$(grep -ho 'INPUT_[A-Z][A-Z0-9_]*' "$script" \
+    "$repo_dir/scripts/workspace.sh" | sort -u)"
   [ "$declared" = "$passed" ]
   [ "$passed" = "$consumed" ]
 }
@@ -1521,7 +2171,8 @@ MARKDOWN
   local declared written
   declared="$(sed -n '/^outputs:/,/^runs:/s/^  \([a-z0-9_]*\):$/\1/p' \
     "$action_file" | sort)"
-  written="$(grep -o 'write_output [a-z0-9_]*' "$script" \
+  written="$(grep -ho 'write_output [a-z0-9_]*' "$script" \
+    "$repo_dir/scripts/workspace.sh" \
     | awk '$2 != "" { print $2 }' | sort -u)"
   [ "$declared" = "$written" ]
   [ "$(grep -c 'steps.publish.outputs.' "$action_file")" -eq "$(printf '%s\n' "$declared" | wc -l)" ]

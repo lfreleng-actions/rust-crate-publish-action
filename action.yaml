@@ -25,12 +25,28 @@ inputs:
     required: false
     default: "."
   manifest_path:
-    description: "Path to the crate's Cargo.toml, relative to path_prefix"
+    # yamllint disable-line rule:line-length
+    description: "Path to the crate's Cargo.toml, or with workspace/packages any workspace manifest, relative to path_prefix"
     required: false
     default: "Cargo.toml"
+  workspace:
+    # yamllint disable-line rule:line-length
+    description: "Publish every workspace member the target registry accepts, in dependency order ('true'/'false')"
+    required: false
+    default: "false"
+  packages:
+    # yamllint disable-line rule:line-length
+    description: "Whitespace-separated workspace members to publish, in dependency order; replaces workspace"
+    required: false
+    default: ""
+  exclude:
+    # yamllint disable-line rule:line-length
+    description: "Whitespace-separated members to leave out; needs workspace 'true'"
+    required: false
+    default: ""
   release_tag:
     # yamllint disable-line rule:line-length
-    description: "Release tag that the Cargo.toml version must match, one leading 'v' ignored; empty skips the check"
+    description: "Release tag that every selected crate's version must match, one leading 'v' ignored; empty skips the check"
     required: false
     default: ""
   max_crate_size_bytes:
@@ -69,31 +85,35 @@ inputs:
 
 outputs:
   crate_name:
-    description: "Crate name, read from its Cargo.toml"
+    # yamllint disable-line rule:line-length
+    description: "Crate name, read from its Cargo.toml; several crates: their names in publish order, space-separated"
     value: ${{ steps.publish.outputs.crate_name }}
   crate_version:
-    description: "Crate version, read from its Cargo.toml"
+    # yamllint disable-line rule:line-length
+    description: "Crate version, read from its Cargo.toml; several crates: a JSON object of name to version"
     value: ${{ steps.publish.outputs.crate_version }}
   crate_size_bytes:
-    description: "Packaged .crate file size in bytes"
+    # yamllint disable-line rule:line-length
+    description: "Packaged .crate file size in bytes; several crates: a JSON object of name to size"
     value: ${{ steps.publish.outputs.crate_size_bytes }}
   crate_sha256:
-    description: "SHA-256 of the verified .crate, as the index records it"
+    # yamllint disable-line rule:line-length
+    description: "SHA-256 of the verified .crate, as the index records it; several crates: a JSON object of name to digest"
     value: ${{ steps.publish.outputs.crate_sha256 }}
   cargo_version:
     description: "Cargo version that packaged the crate"
     value: ${{ steps.publish.outputs.cargo_version }}
   registry_status:
     # yamllint disable-line rule:line-length
-    description: "This version on the target registry: 'absent', 'identical' (same archive) or 'different'"
+    description: "This version on the target registry: 'absent', 'identical' (same archive) or 'different'; several crates: a JSON object"
     value: ${{ steps.publish.outputs.registry_status }}
   publish_status:
     # yamllint disable-line rule:line-length
-    description: "Outcome: 'published', 'skipped' (identical already there), 'dry-run' or 'failed'"
+    description: "Outcome: 'published' (any crate uploaded), 'skipped' (all identical already there), 'dry-run' or 'failed'"
     value: ${{ steps.publish.outputs.publish_status }}
   published:
     # yamllint disable-line rule:line-length
-    description: "'true' when this run uploaded the crate; 'false' for a skip too, see publish_status"
+    description: "'true' when this run uploaded a crate, even before a later failure; 'false' for a skip too"
     value: ${{ steps.publish.outputs.published }}
 
 runs:
@@ -106,6 +126,9 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
         INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
         INPUT_MANIFEST_PATH: ${{ inputs.manifest_path }}
+        INPUT_WORKSPACE: ${{ inputs.workspace }}
+        INPUT_PACKAGES: ${{ inputs.packages }}
+        INPUT_EXCLUDE: ${{ inputs.exclude }}
         INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
         INPUT_MAX_CRATE_SIZE_BYTES: ${{ inputs.max_crate_size_bytes }}
         INPUT_DRY_RUN: ${{ inputs.dry_run }}

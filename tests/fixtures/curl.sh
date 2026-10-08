@@ -7,7 +7,9 @@
 # -w. A second entry request, after a failed upload, answers with the
 # MOCK_INDEX_*_2 values when set. A named registry's config.json
 # answers with MOCK_CONFIG_STATUS and MOCK_CONFIG_BODY, by default a
-# valid config with an HTTPS API.
+# valid config with an HTTPS API. With MOCK_INDEX_DIR set, an entry
+# request serves the file named after the crate there instead, and
+# MOCK_INDEX_DIR_MISSING (default 404) without one.
 
 set -euo pipefail
 
@@ -35,6 +37,18 @@ if [[ "$url" == */config.json ]]; then
       '"api":"https://api.example.test"}' > "$out"
   fi
   printf '%s' "${MOCK_CONFIG_STATUS:-200}"
+  exit 0
+fi
+
+if [ -n "${MOCK_INDEX_DIR:-}" ]; then
+  entry="$MOCK_INDEX_DIR/${url##*/}"
+  if [ -f "$entry" ]; then
+    cp "$entry" "$out"
+    printf '200'
+  else
+    : > "$out"
+    printf '%s' "${MOCK_INDEX_DIR_MISSING:-404}"
+  fi
   exit 0
 fi
 
