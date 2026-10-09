@@ -12,8 +12,8 @@
 #
 #   Check inputs -> Check toolchain -> Read crate metadata
 #   -> Verify release tag -> Package -> Check package size
-#   -> Match verified digest -> Check crates.io -> Dry-run publish
-#   -> Confirm package unchanged -> Publish
+#   -> Match verified digest -> Check crates.io -> Check semver (opt-in)
+#   -> Dry-run publish -> Confirm package unchanged -> Publish
 #
 # A named registry adds 'Read registry config' after the workspace is
 # prepared, and checks that registry in place of crates.io.
@@ -33,6 +33,8 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$script_dir/job-summary.sh"
 # shellcheck source=workspace.sh
 source "$script_dir/workspace.sh"
+# shellcheck source=semver-checks.sh
+source "$script_dir/semver-checks.sh"
 
 path_prefix="${INPUT_PATH_PREFIX:-.}"
 manifest_path="${INPUT_MANIFEST_PATH:-Cargo.toml}"
@@ -47,6 +49,9 @@ summary="${INPUT_SUMMARY:-true}"
 expected_sha256="${INPUT_EXPECTED_SHA256:-}"
 registry_token="${INPUT_REGISTRY_TOKEN:-}"
 registry="${INPUT_REGISTRY:-}"
+# Inputs of the opt-in semver stage, scripts/semver-checks.sh.
+semver_checks="${INPUT_SEMVER_CHECKS:-false}"
+semver_tool_version="${INPUT_CARGO_SEMVER_CHECKS_VERSION-0.51.0}"
 # Keep the token out of the environment Cargo and its children inherit.
 # This does not hide it from same-user processes that read an
 # ancestor's /proc/<pid>/environ; see expected_sha256 for isolation.
@@ -110,6 +115,15 @@ write_output() {
   fi
 }
 
+# Outputs of the opt-in semver stage, scripts/semver-checks.sh.
+semver_output_status() {
+  write_output semver_status "$1"
+}
+
+semver_output_baseline() {
+  write_output semver_baseline "$1"
+}
+
 render_summary() {
   local status="$1" outcome="" subject="" link=""
   if [ "$set_mode" = "true" ]; then
@@ -157,11 +171,17 @@ render_summary() {
       summary_row "Not publishable" "$(summary_cell "$set_skipped")"
     fi
     set_summary_rows
+    if [ "$semver_checks" = "true" ]; then
+      summary_row "Semver" "$semver_cell"
+    fi
     write_summary "$outcome" "$failure_reason"
     return 0
   fi
   summary_row "Package size" "$size_cell"
   summary_row "$(summary_cell "$registry_label")" "$registry_cell"
+  if [ "$semver_checks" = "true" ]; then
+    summary_row "Semver" "$semver_cell"
+  fi
   if [ -n "$crate_sha256" ]; then
     summary_row "SHA-256" "$(summary_code "$crate_sha256")"
   fi
@@ -634,6 +654,8 @@ if [ -n "$registry_token" ]; then
   echo "::add-mask::$registry_token"
 fi
 
+semver_check_inputs
+
 # A dry run with a release tag is a release's verification job: fail it
 # for anything that would stop the release, rather than letting the
 # later publishing job find out.
@@ -871,6 +893,10 @@ case "$registry_status" in
     ;;
 esac
 write_output registry_status "$registry_status"
+
+### Check semver ###
+
+semver_check_stage
 
 ### Dry-run publish ###
 

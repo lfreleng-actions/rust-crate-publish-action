@@ -116,6 +116,28 @@ steps:
 
 <!-- markdownlint-enable MD013 MD046 -->
 
+### Check semver compatibility before release
+
+Add `semver_checks` to the unprivileged `verify` job. It compares the
+crate's public API with the latest earlier release on crates.io and
+fails the job when the version number does not allow the change, so
+`publish` never runs. The `publish` job must leave it unset: the
+action refuses it there. See [Semver checks](#semver-checks).
+
+<!-- markdownlint-disable MD013 MD046 -->
+
+```yaml
+      - name: "Verify crate"
+        id: verify
+        uses: lfreleng-actions/rust-crate-publish-action@main
+        with:
+          release_tag: ${{ github.event.release.tag_name }}
+          dry_run: 'true'
+          semver_checks: 'true'
+```
+
+<!-- markdownlint-enable MD013 MD046 -->
+
 ### Publish workspace members in dependency order
 
 Set `workspace` to `true` to publish every member that crates.io
@@ -277,26 +299,32 @@ for crates.io, means the same as an empty `registry`.
   dependencies there, and its `api` host to publish. For staging
   these are `index.staging.crates.io`, `static.staging.crates.io` and
   `staging.crates.io`.
+- For `semver_checks`, a toolchain that `cargo-semver-checks` supports:
+  the default version, 0.51.0, needs Rust 1.93 or newer. It also
+  downloads the tool from GitHub releases (`github.com` and
+  `*.githubusercontent.com`).
 
 ## Inputs
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                 | Required | Default      | Description                                                                                                                           |
-| -------------------- | -------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| path_prefix          | False    | `.`          | Directory containing the crate or workspace; must resolve within the workspace                                                        |
-| manifest_path        | False    | `Cargo.toml` | Path to the crate's `Cargo.toml`, relative to `path_prefix`; with `workspace` or `packages`, any manifest of the workspace            |
-| workspace            | False    | `false`      | Publish every workspace member that the target registry accepts, in dependency order                                                  |
-| packages             | False    |              | Whitespace-separated workspace members to publish, in dependency order; replaces `workspace`                                          |
-| exclude              | False    |              | Whitespace-separated members to leave out; needs `workspace: true` and an empty `packages`                                            |
-| release_tag          | False    |              | Release tag that every selected crate's version must match, one leading `v` ignored                                                   |
-| max_crate_size_bytes | False    | `10485760`   | Largest allowed packaged `.crate` size in bytes; the default matches the crates.io 10MB cap                                           |
-| dry_run              | False    | `false`      | Check and package without publishing; needs no credentials                                                                            |
-| registry             | False    |              | Cargo registry name to publish to; empty or `crates-io` means crates.io. Needs `CARGO_REGISTRIES_<NAME>_INDEX`                        |
-| registry_token       | False    |              | Registry token for the upload alone; empty falls back to the caller's Cargo credentials                                               |
-| expected_sha256      | False    |              | `crate_sha256` from an earlier `dry_run` job, a JSON object for two or more crates; skips compilation and refuses a differing archive |
-| permit_fail          | False    | `false`      | Report success even when a stage fails                                                                                                |
-| summary              | False    | `true`       | Write a crate table to the job summary                                                                                                |
+| Name                        | Required | Default      | Description                                                                                                                           |
+| --------------------------- | -------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| path_prefix                 | False    | `.`          | Directory containing the crate or workspace; must resolve within the workspace                                                        |
+| manifest_path               | False    | `Cargo.toml` | Path to the crate's `Cargo.toml`, relative to `path_prefix`; with `workspace` or `packages`, any manifest of the workspace            |
+| workspace                   | False    | `false`      | Publish every workspace member that the target registry accepts, in dependency order                                                  |
+| packages                    | False    |              | Whitespace-separated workspace members to publish, in dependency order; replaces `workspace`                                          |
+| exclude                     | False    |              | Whitespace-separated members to leave out; needs `workspace: true` and an empty `packages`                                            |
+| release_tag                 | False    |              | Release tag that every selected crate's version must match, one leading `v` ignored                                                   |
+| max_crate_size_bytes        | False    | `10485760`   | Largest allowed packaged `.crate` size in bytes; the default matches the crates.io 10MB cap                                           |
+| dry_run                     | False    | `false`      | Check and package without publishing; needs no credentials                                                                            |
+| registry                    | False    |              | Cargo registry name to publish to; empty or `crates-io` means crates.io. Needs `CARGO_REGISTRIES_<NAME>_INDEX`                        |
+| registry_token              | False    |              | Registry token for the upload alone; empty falls back to the caller's Cargo credentials                                               |
+| expected_sha256             | False    |              | `crate_sha256` from an earlier `dry_run` job, a JSON object for two or more crates; skips compilation and refuses a differing archive |
+| permit_fail                 | False    | `false`      | Report success even when a stage fails                                                                                                |
+| semver_checks               | False    | `false`      | Run `cargo-semver-checks` against the latest earlier crates.io release; crates.io dry runs alone                                      |
+| cargo_semver_checks_version | False    | `0.51.0`     | `cargo-semver-checks` version to install for `semver_checks`                                                                          |
+| summary                     | False    | `true`       | Write a crate table to the job summary                                                                                                |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -317,6 +345,8 @@ value fails the run.
 | registry_status  | This version on the target registry: `absent`, `identical` (same archive) or `different`; two or more crates: a JSON object |
 | publish_status   | Outcome: `published` (any crate uploaded), `skipped` (every archive already there), `dry-run` or `failed`                   |
 | published        | `true` when this run uploaded a crate, even before a later failure; `false` for a skip too                                  |
+| semver_status    | `semver_checks` outcome: `passed`, `failed` or `skipped`; empty when off or not reached; two or more crates: a JSON object  |
+| semver_baseline  | crates.io version that `semver_checks` compared against; empty when none; two or more crates: a JSON object                 |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -352,11 +382,14 @@ The action runs these stages in order, and the first failure stops it:
 9. **Check crates.io**, or the named registry: looks the version up
    in the registry's index and compares its recorded checksum with
    the `.crate`; see below.
-10. **Dry-run publish**: `cargo publish --dry-run` runs the registry
+10. **Check semver**: with `semver_checks`, runs the
+    `cargo-semver-checks` executable directly (`check-release`), not
+    through Cargo; see below.
+11. **Dry-run publish**: `cargo publish --dry-run` runs the registry
     checks without uploading.
-11. **Confirm package unchanged**: repackages without running crate
+12. **Confirm package unchanged**: repackages without running crate
     code and requires a byte-identical `.crate`; see below.
-12. **Publish**: unless `dry_run` is `true`, uploads the crate.
+13. **Publish**: unless `dry_run` is `true`, uploads the crate.
 
 Packages go to a target directory the action creates, and it removes
 that directory afterwards, so the checkout stays untouched.
@@ -569,6 +602,149 @@ The action cannot hide files such as `$CARGO_HOME/credentials.toml`
 from code in the same job, so prefer `registry_token` with a
 short-lived Trusted Publishing token.
 
+### Semver checks
+
+crates.io versions are permanent, and Cargo upgrades dependents to any
+newer minor or patch release. A breaking change published as a patch
+breaks the next build of every dependent. With `semver_checks` set to
+`true`, the action runs
+[cargo-semver-checks](https://github.com/obi1kenobi/cargo-semver-checks)
+to catch that before release.
+
+**Unprivileged dry runs alone.** The check compiles the crate and
+the published baseline, running their build scripts and procedural
+macros. It fails the run, whatever `permit_fail` says, when the run
+could publish or holds a publishing credential:
+
+- `dry_run` is `false`;
+- `expected_sha256` holds a value: the publishing job of the two-job
+  pattern, which compiles nothing;
+- `registry_token` holds a value;
+- `CARGO_REGISTRY_TOKEN` or any `CARGO_REGISTRIES_<NAME>_TOKEN` holds a
+  value in the environment;
+- `ACTIONS_ID_TOKEN_REQUEST_TOKEN` or `ACTIONS_ID_TOKEN_REQUEST_URL`
+  holds a value, meaning the job has `id-token: write`;
+- `$CARGO_HOME/credentials.toml` or `$CARGO_HOME/credentials` exists.
+  The action resolves a relative `CARGO_HOME` from `path_prefix`, as
+  the **Package** stage's Cargo does; see **Cargo home** below.
+
+An empty variable carries no credential and does not count. Run the
+check in the `verify` job, as shown in
+[Check semver compatibility before release](#check-semver-compatibility-before-release).
+
+**crates.io alone.** `cargo-semver-checks` takes its baseline from
+crates.io and supports no other registry. A crate bound for a named
+`registry` may have no release on crates.io, or crates.io may hold an
+unrelated crate under the same name, and the comparison would mean
+nothing. The action fails the run, whatever `permit_fail` says, when
+`semver_checks` meets a named `registry`, rather than skipping with a
+notice: a skip would leave a passing job that checked nothing.
+`registry: crates-io` names crates.io and works.
+
+**Workspace sets.** When `workspace` or `packages` selects two or more
+crates, the check runs for each crate of the set in publish order,
+from that crate's own manifest, against that crate's latest earlier
+release on crates.io, by the baseline rules below. A crate's first
+release skips with a notice, as does a crate whose exact archive
+crates.io already holds, and the rest of the set still runs the
+check. Each crate compiles from the workspace as it stands, with its
+sibling dependencies as path dependencies, so the comparison is the
+one `cargo-semver-checks` makes for that crate alone. The check runs
+after **Check crates.io** and before **Dry-run publish** and
+**Confirm package unchanged**, as for one crate. A crate with
+breaking changes does not stop the others, so one run reports every
+finding; the run then fails with the first failure's exit status. An
+index or tool error fails at once. `semver_status` and
+`semver_baseline` become JSON objects keyed by crate name, as the
+set's other outputs do, and the **Semver** row lists each crate. A
+selection of one crate runs the check as `manifest_path` would.
+
+**Baseline.** The check compares against the highest version on
+crates.io that is neither yanked nor a pre-release, and not above the
+crate's own version. A pre-release compares against an earlier
+release. When crates.io holds this version with different bytes, as in
+a plain dry run of a published version, the check compares against
+that published version. It skips, with a notice, when:
+
+- crates.io holds no such version, as for a first release;
+- crates.io already holds this exact archive, so nothing new would
+  ship.
+
+An index lookup that fails, or that answers with anything other than
+index entries, fails the run instead of skipping: a malformed or empty
+response never counts as a first release.
+
+**Placement.** The check runs after **Check crates.io**, because the
+skip for an identical archive needs the packaged digest and the
+registry state. It runs before **Confirm package unchanged**, so that
+stage also catches any source edits made by code the check compiled.
+
+**Findings** appear in the step log, as `cargo-semver-checks` prints
+them, and in a **Semver** row of the job summary that names the failed
+lints. They fail the run, and the step exits with the tool's status,
+100 for failed lints. With `permit_fail: true` the step reports
+success instead, and `semver_status` stays `failed`.
+
+**Environment.** The check runs from a fresh empty directory, with an
+absolute `--manifest-path`, pinned to the same toolchain as every
+stage, and builds under the action's temporary directory.
+`cargo-semver-checks` resolves crates.io through any source
+replacement in the Cargo configuration of its working directory, so
+from the project directory a checked-in `.cargo/config.toml` could
+swap in a forged baseline and fake a pass. As a consequence, the
+project's `.cargo/config.toml` does not apply to the check's builds;
+it still applies to **Package**. rustup finds a path-based toolchain
+from the project directory alone, so such a toolchain keeps the check
+there; the action already warns about it. The action runs the
+`cargo-semver-checks` executable itself, not `cargo semver-checks`: a
+Cargo alias in the checkout could shadow that subcommand and fake a
+pass. The tool and everything it starts get the environment scrub
+that every Cargo stage gets, from the same helper; see
+[Credential handling](#credential-handling). They never see
+`CARGO_REGISTRY_TOKEN`, any `CARGO_REGISTRIES_<NAME>_TOKEN`,
+`ACTIONS_ID_TOKEN_REQUEST_TOKEN`, `ACTIONS_ID_TOKEN_REQUEST_URL`,
+`ACTIONS_RUNTIME_TOKEN`, or the runner command files `GITHUB_OUTPUT`,
+`GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STATE` and `GITHUB_STEP_SUMMARY`.
+Withholding the command files stops crate code from casually forging
+step outputs, environment variables, `PATH` entries or the job
+summary. That is defence in depth, not a boundary: their paths are
+predictable, and same-user code can still find them.
+
+**Cargo home.** Cargo also reads source replacement from
+`$CARGO_HOME/config.toml`, so a Cargo home inside the checkout would let
+checkout files swap in a forged baseline. With `semver_checks` set to
+`true`, the action fails the run, whatever `permit_fail` says, when
+`CARGO_HOME` resolves inside `GITHUB_WORKSPACE`. It resolves a relative
+value from `path_prefix`, as the **Package** stage's Cargo does, and
+follows symlinks through every directory of that path that exists. The
+check then gets that resolved, absolute path. An unset `CARGO_HOME`,
+meaning `~/.cargo`, is fine.
+
+**Limits.** The check catches accidental breaking changes, but offers
+no boundary against a hostile checkout: the build scripts and procedural
+macros it compiles run as the job's user, and the crate's own
+`cargo-semver-checks` lint settings in `Cargo.toml` can relax lints.
+Review changes to those as you would any release-relevant code.
+
+Cargo still honours source replacement in a Cargo home outside the
+checkout, and in `.cargo/config.toml` in any parent directory of the
+check's working directory outside the checkout, such as
+`/home/runner/.cargo/config.toml` on GitHub-hosted runners. Writing
+those takes code that already ran as the job's user earlier in the same
+job, such as an earlier step, or the build scripts that **Package**
+compiles before the check. As with the environment scrub, the action
+draws its boundary at the job: run the check in a job that compiles
+nothing else beforehand, and whose setup does not replace crates.io.
+
+**Tool and toolchain.** The action installs `cargo-semver-checks`
+through `taiki-e/install-action` as a prebuilt, checksum-verified
+release, with no fallback to other download methods.
+`cargo_semver_checks_version` must name a version that the pinned
+install-action release lists. `cargo-semver-checks` reads rustdoc JSON, an unstable
+format, so each release supports a range of Rust versions: 0.51.0
+needs Rust 1.93 or newer. A project that pins an older toolchain
+needs an older `cargo_semver_checks_version`.
+
 ### Failure handling
 
 Errors name the input or stage at fault and keep Cargo's exit code.
@@ -616,8 +792,9 @@ published, ✅ dry run passed, and ❌ failed at a named stage, with
 ⚠️ marking a failure that `permit_fail` let through. Checks the run
 never reached read "Not reached". A crate published to or skipped on
 crates.io links to its crates.io page; for a named registry, the
-summary names the registry and gives no link. The summary never
-includes credentials.
+summary names the registry and gives no link. With `semver_checks`, a
+**Semver** row reports the check. The summary never includes
+credentials.
 
 ## Testing
 
