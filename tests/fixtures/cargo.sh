@@ -12,6 +12,13 @@
 # package and publish calls also accept trailing '-p NAME' pairs: the
 # named crates are packaged as one set, and a real publish of a set
 # records each upload in MOCK_INDEX_DIR, as crates.io's index would.
+#
+# With MOCK_STAMP_ROOT set, the workspace is real files below that
+# root, as the version input needs: each NAME:DIR in MOCK_STAMP_MEMBERS
+# is a member ('.' for the root), whose version metadata reads from its
+# manifest, or from the root's for 'version.workspace = true'. Package
+# and publish calls then expect '--allow-dirty' after '--locked' when
+# MOCK_EXPECT_ALLOW_DIRTY is 'true', and refuse it otherwise.
 
 set -euo pipefail
 
@@ -24,6 +31,41 @@ if [ -n "${MOCK_EXPECT_REGISTRY:-}" ]; then
 fi
 publish_registry="${MOCK_EXPECT_REGISTRY:-crates-io}"
 member_manifest="${MOCK_EXPECT_PACKAGE_MANIFEST:-$manifest}"
+dirty=()
+if [ "${MOCK_EXPECT_ALLOW_DIRTY:-false}" = "true" ]; then
+  dirty=(--allow-dirty)
+fi
+
+# The first version line of a manifest, double or single quoted.
+stamp_version() {
+  local file="$1"
+  if grep -q '^version\.workspace = true' "$file"; then
+    file="$MOCK_STAMP_ROOT/Cargo.toml"
+  fi
+  sed -nE "s/^version[[:space:]]*=[[:space:]]*[\"']([^\"']*)[\"'].*/\\1/p" \
+    "$file" | head -n 1
+}
+
+if [ -n "${MOCK_STAMP_ROOT:-}" ]; then
+  entries="[]"
+  for spec in $MOCK_STAMP_MEMBERS; do
+    file="$MOCK_STAMP_ROOT/${spec#*:}/Cargo.toml"
+    if [ "${spec#*:}" = . ]; then
+      file="$MOCK_STAMP_ROOT/Cargo.toml"
+    fi
+    publish=null
+    if grep -q '^publish = false' "$file"; then
+      publish="[]"
+    fi
+    entries="$(jq -c --arg n "${spec%%:*}" --arg v "$(stamp_version "$file")" \
+      --arg m "$file" --argjson p "$publish" '. + [{
+        id: ("path+file://" + $m + "#" + $n + "@" + $v),
+        name: $n, version: $v, manifest_path: $m, publish: $p}]' \
+      <<< "$entries")"
+  done
+  printf '%s\n' "$entries" > "$MOCK_STAMP_JSON"
+  export MOCK_WORKSPACE_JSON="$MOCK_STAMP_JSON"
+fi
 case "${1:-}" in
   --version)
     stage=version
@@ -37,12 +79,12 @@ case "${1:-}" in
   package)
     if [ "${2:-}" = "--no-verify" ]; then
       stage=repackage
-      expected=(package --no-verify --locked
+      expected=(package --no-verify --locked ${dirty[@]+"${dirty[@]}"}
         ${package_registry[@]+"${package_registry[@]}"} --target-dir @TARGET
         --manifest-path @MANIFEST)
     else
       stage=package
-      expected=(package --locked
+      expected=(package --locked ${dirty[@]+"${dirty[@]}"}
         ${package_registry[@]+"${package_registry[@]}"} --target-dir @TARGET
         --manifest-path @MANIFEST)
     fi
@@ -51,12 +93,12 @@ case "${1:-}" in
     if [ "${2:-}" = "--dry-run" ]; then
       stage=dry-run
       expected=(publish --dry-run --no-verify --locked
-        --registry "$publish_registry" --target-dir @TARGET
+        ${dirty[@]+"${dirty[@]}"} --registry "$publish_registry" --target-dir @TARGET
         --manifest-path @MANIFEST)
     else
       stage=publish
-      expected=(publish --no-verify --locked --registry "$publish_registry"
-        --target-dir @TARGET --manifest-path @MANIFEST)
+      expected=(publish --no-verify --locked ${dirty[@]+"${dirty[@]}"}
+        --registry "$publish_registry" --target-dir @TARGET --manifest-path @MANIFEST)
     fi
     ;;
   *)
@@ -223,7 +265,10 @@ case "$stage" in
     ;;
   metadata)
     if [ -n "${MOCK_WORKSPACE_JSON:-}" ]; then
-      jq '{packages: ., workspace_members: map(.id)}' "$MOCK_WORKSPACE_JSON"
+      jq --arg root "${MOCK_STAMP_ROOT:-}" '{packages: .,
+        workspace_members: map(.id)}
+        + if $root == "" then {} else {workspace_root: $root} end' \
+        "$MOCK_WORKSPACE_JSON"
       exit 0
     fi
     other_packages="[]"
@@ -237,6 +282,22 @@ case "$stage" in
       '{packages: ($extra + [($pkg + {manifest_path: $manifest})])}'
     ;;
   package | repackage)
+    # A build script that edits the checkout while Cargo verifies.
+    if [ "$stage" = package ] && [ -n "${MOCK_PACKAGE_WRITES:-}" ]; then
+      printf 'changed\n' >> "$MOCK_PACKAGE_WRITES"
+    fi
+    # A process that outlives verification and edits the checkout
+    # while Cargo repackages to confirm the archive.
+    if [ "$stage" = repackage ] && [ -n "${MOCK_REPACKAGE_WRITES:-}" ]; then
+      printf 'changed\n' >> "$MOCK_REPACKAGE_WRITES"
+    fi
+    # Any other edit, as a shell command run at either stage.
+    if [ "$stage" = package ] && [ -n "${MOCK_PACKAGE_RUNS:-}" ]; then
+      bash -c "$MOCK_PACKAGE_RUNS"
+    fi
+    if [ "$stage" = repackage ] && [ -n "${MOCK_REPACKAGE_RUNS:-}" ]; then
+      bash -c "$MOCK_REPACKAGE_RUNS"
+    fi
     # Identical bytes on repackaging, as Cargo's reproducible archives
     # give, unless the test simulates sources changed after
     # verification.

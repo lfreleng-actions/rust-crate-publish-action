@@ -298,13 +298,13 @@ publish_crate_set() {
   stage="Package"
   if [ -n "$expected_sha256" ]; then
     trusted_cargo package --no-verify --locked \
-      ${package_registry[@]+"${package_registry[@]}"} \
+      ${dirty_args[@]+"${dirty_args[@]}"} ${package_registry[@]+"${package_registry[@]}"} \
       --target-dir "$package_target" --manifest-path "$manifest_abs" \
       "${select_args[@]}"
     verification_cell="⏸️ Awaiting digest match"
   else
     cargo_with_annotations project_cargo package --locked \
-      ${package_registry[@]+"${package_registry[@]}"} \
+      ${dirty_args[@]+"${dirty_args[@]}"} ${package_registry[@]+"${package_registry[@]}"} \
       --target-dir "$package_target" --manifest-path "$manifest_abs" \
       "${select_args[@]}"
     verification_cell="✅ Compiled and verified in this job"
@@ -399,12 +399,14 @@ publish_crate_set() {
 
   stage="Dry-run publish"
   cargo_with_annotations trusted_cargo publish --dry-run --no-verify --locked \
-    --registry "$publish_registry" --target-dir "$package_target" \
-    --manifest-path "$manifest_abs" "${remaining_args[@]}"
+    ${dirty_args[@]+"${dirty_args[@]}"} --registry "$publish_registry" \
+    --target-dir "$package_target" --manifest-path "$manifest_abs" \
+    "${remaining_args[@]}"
 
   stage="Confirm package unchanged"
+  stamp_recheck_tree
   trusted_cargo package --no-verify --locked \
-    ${package_registry[@]+"${package_registry[@]}"} \
+    ${dirty_args[@]+"${dirty_args[@]}"} ${package_registry[@]+"${package_registry[@]}"} \
     --target-dir "$package_target" --manifest-path "$manifest_abs" \
     "${select_args[@]}"
   for i in "${!set_names[@]}"; do
@@ -429,7 +431,9 @@ publish_crate_set() {
   stage="Publish"
   crate_name="${remaining_names[*]}"
   describe_trusted_publisher
-  publishing_cargo publish --no-verify --locked --registry "$publish_registry" \
+  stamp_recheck_tree
+  publishing_cargo publish --no-verify --locked \
+    ${dirty_args[@]+"${dirty_args[@]}"} --registry "$publish_registry" \
     --target-dir "$package_target" --manifest-path "$manifest_abs" \
     "${remaining_args[@]}" || upload_status=$?
   if [ "$upload_status" -eq 0 ]; then

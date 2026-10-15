@@ -18,7 +18,9 @@ description: "Packages a Rust crate, checks its size and version, and publishes 
 # Trusted Publishing via rust-lang/crates-io-auth-action. A named
 # 'registry' takes its sparse index URL from the caller's
 # CARGO_REGISTRIES_<NAME>_INDEX. A 'toolchain' input pins one rustup
-# toolchain for every stage, installing it when missing.
+# toolchain for every stage, installing it when missing. A 'version'
+# input writes a release version over the placeholder 0.0.0 that a
+# tag-versioned project keeps in Cargo.toml.
 
 inputs:
   # Optional
@@ -50,6 +52,11 @@ inputs:
   release_tag:
     # yamllint disable-line rule:line-length
     description: "Release tag that every selected crate's version must match, one leading 'v' ignored; empty skips the check"
+    required: false
+    default: ""
+  version:
+    # yamllint disable-line rule:line-length
+    description: "SemVer version, such as 1.2.3, to write over the placeholder 0.0.0 every workspace member keeps in Cargo.toml; empty uses Cargo.toml as it is. Pass verify and publish jobs the same value"
     required: false
     default: ""
   max_crate_size_bytes:
@@ -107,7 +114,7 @@ outputs:
     value: ${{ steps.publish.outputs.crate_name }}
   crate_version:
     # yamllint disable-line rule:line-length
-    description: "Crate version, read from its Cargo.toml; several crates: a JSON object of name to version"
+    description: "Crate version, read from its Cargo.toml after any version input applies; several crates: a JSON object of name to version"
     value: ${{ steps.publish.outputs.crate_version }}
   crate_size_bytes:
     # yamllint disable-line rule:line-length
@@ -184,6 +191,7 @@ runs:
         INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
         INPUT_MAX_CRATE_SIZE_BYTES: ${{ inputs.max_crate_size_bytes }}
         INPUT_TOOLCHAIN: ${{ inputs.toolchain }}
+        INPUT_VERSION: ${{ inputs.version }}
         INPUT_DRY_RUN: ${{ inputs.dry_run }}
         INPUT_REGISTRY: ${{ inputs.registry }}
         INPUT_REGISTRY_TOKEN: ${{ inputs.registry_token }}

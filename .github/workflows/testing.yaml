@@ -401,6 +401,176 @@ jobs:
           echo "Workspace set dry runs verified ✅"
           echo "Workspace set dry runs verified ✅" >> "$GITHUB_STEP_SUMMARY"
 
+  test-version-input:
+    name: "Test: dry run (version input)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A tag-versioned workspace: every member holds the placeholder
+      # 0.0.0, core through [workspace.package] and app directly, and
+      # app requires core at exactly that version. Run-unique names and
+      # a nested repository, as for the fixtures above.
+      - name: "Create tag-versioned fixture"
+        id: fixture
+        shell: bash
+        run: |
+          # Create tag-versioned fixture
+          set -euo pipefail
+          suffix="$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+          prefix="lfreleng-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          mkdir -p tagged/core/src tagged/app/src
+          printf '%s\n' '[workspace]' 'members = ["core", "app"]' \
+            'resolver = "2"' '[workspace.package]' \
+            'version = "0.0.0"  # set from the release tag' \
+            'edition = "2021"' 'license = "Apache-2.0"' \
+            'description = "Fixture for rust-crate-publish-action"' \
+            > tagged/Cargo.toml
+          printf '%s\n' '[package]' "name = \"$prefix-core\"" \
+            'version.workspace = true' 'edition.workspace = true' \
+            'license.workspace = true' 'description.workspace = true' \
+            > tagged/core/Cargo.toml
+          dependency="tagged-core = { path = \"../core\","
+          dependency+=" version = \"=0.0.0\", package = \"$prefix-core\" }"
+          printf '%s\n' '[package]' "name = \"$prefix-app\"" \
+            'version = "0.0.0"' 'edition.workspace = true' \
+            'license.workspace = true' 'description.workspace = true' \
+            '[dependencies]' "$dependency" > tagged/app/Cargo.toml
+          printf '%s\n' 'pub fn fixture() -> u8 { 1 }' > tagged/core/src/lib.rs
+          printf '%s\n' 'pub fn fixture() -> u8 { tagged_core::fixture() }' \
+            > tagged/app/src/lib.rs
+          printf '%s\n' '/target' > tagged/.gitignore
+          cargo generate-lockfile --offline --manifest-path tagged/Cargo.toml
+          git -C tagged init -q
+          git -C tagged add -A
+          git -C tagged -c user.name=CI -c user.email=ci@example.org \
+            -c commit.gpgsign=false commit -q -m 'Fixture'
+
+      - name: "Running local action: stamped release verification"
+        id: stamped
+        uses: $/
+        with:
+          path_prefix: tagged
+          workspace: 'true'
+          version: '1.4.0-rc.1'
+          release_tag: 'v1.4.0-rc.1'
+          dry_run: 'true'
+
+      - name: "Record the stamped checkout, then restore it"
+        id: checkout-state
+        shell: bash
+        run: |
+          # Record the stamped checkout, then restore it
+          set -euo pipefail
+          manifest=tagged/app/Cargo.toml
+          status="$(git -C tagged status --porcelain | sort | tr '\n' ',')"
+          # grep -c prints 0 and fails on no match; the check reports it.
+          app="$(grep -c '^version = "1.4.0-rc.1"$' "$manifest" || true)"
+          dependency="$(grep -c 'version = "=1.4.0-rc.1"' "$manifest" || true)"
+          {
+            echo "status=$status"
+            echo "app=$app"
+            echo "dependency=$dependency"
+          } >> "$GITHUB_OUTPUT"
+          # The publishing job starts from a fresh checkout of the tag.
+          git -C tagged checkout -q -- .
+
+      # The publishing job of the two-job pattern: the same version, a
+      # fresh checkout, and the digests the verifying run reported.
+      - name: "Running local action: stamped, given the verified digests"
+        id: stamped-digest
+        uses: $/
+        with:
+          path_prefix: tagged
+          workspace: 'true'
+          version: '1.4.0-rc.1'
+          expected_sha256: ${{ steps.stamped.outputs.crate_sha256 }}
+          dry_run: 'true'
+
+      - name: "Add a change besides the version rewrite"
+        shell: bash
+        run: |
+          # Add a change besides the version rewrite
+          git -C tagged checkout -q -- .
+          printf '%s\n' 'not committed' > tagged/core/src/notes.txt
+
+      - name: "Running local action: unrelated change"
+        id: unrelated
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: tagged
+          workspace: 'true'
+          version: '1.4.0-rc.1'
+          dry_run: 'true'
+
+      - name: "Verify version input outputs"
+        shell: bash
+        env:
+          PREFIX: ${{ steps.fixture.outputs.prefix }}
+          STAMPED_VERSION: ${{ steps.stamped.outputs.crate_version }}
+          STAMPED_SHA256: ${{ steps.stamped.outputs.crate_sha256 }}
+          STAMPED_STATUS: ${{ steps.stamped.outputs.publish_status }}
+          CHECKOUT_STATUS: ${{ steps.checkout-state.outputs.status }}
+          CHECKOUT_APP: ${{ steps.checkout-state.outputs.app }}
+          CHECKOUT_DEPENDENCY: ${{ steps.checkout-state.outputs.dependency }}
+          DIGEST_VERSION: ${{ steps.stamped-digest.outputs.crate_version }}
+          DIGEST_SHA256: ${{ steps.stamped-digest.outputs.crate_sha256 }}
+          DIGEST_STATUS: ${{ steps.stamped-digest.outputs.publish_status }}
+          UNRELATED_OUTCOME: ${{ steps.unrelated.outcome }}
+        run: |
+          # Verify version input outputs
+          errors=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "Unexpected $1: '$2' (expected '$3') ❌"
+              errors=1
+            fi
+          }
+          versions="$(jq -cn --arg p "$PREFIX" \
+            '{($p + "-core"): "1.4.0-rc.1", ($p + "-app"): "1.4.0-rc.1"}')"
+          check "crate_version" "$STAMPED_VERSION" "$versions"
+          check "crate_sha256 keys" \
+            "$(jq -c 'keys_unsorted' <<< "$STAMPED_SHA256")" \
+            "$(jq -c 'keys_unsorted' <<< "$versions")"
+          check "publish_status" "$STAMPED_STATUS" dry-run
+          check "stamped checkout" "$CHECKOUT_STATUS" \
+            " M Cargo.lock, M Cargo.toml, M app/Cargo.toml,"
+          check "app version" "$CHECKOUT_APP" 1
+          check "app requirement on core" "$CHECKOUT_DEPENDENCY" 1
+          check "expected_sha256 run crate_version" "$DIGEST_VERSION" \
+            "$versions"
+          check "expected_sha256 run crate_sha256" "$DIGEST_SHA256" \
+            "$STAMPED_SHA256"
+          check "expected_sha256 run publish_status" "$DIGEST_STATUS" dry-run
+          check "unrelated change" "$UNRELATED_OUTCOME" failure
+          if [ "$errors" != 0 ]; then
+            echo "Version input tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Version input dry runs verified ✅"
+          echo "Version input dry runs verified ✅" >> "$GITHUB_STEP_SUMMARY"
+
   ### Dry run against the shared test project ###
   test-rust-project:
     name: "Test: dry run (test-rust-project)"

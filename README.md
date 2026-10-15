@@ -189,6 +189,39 @@ Either way Cargo cannot verify a crate until the crates it depends
 on reach crates.io, so verifying the whole set before anything
 publishes needs the workspace inputs above.
 
+### Take the version from the release tag
+
+A tag-versioned project keeps the placeholder version `0.0.0` in
+every member's `Cargo.toml`, and `version` supplies the release: the
+tag's version without its leading `v`. Pass both jobs the same
+`version` and the same exact `toolchain`, so they package the same
+archive; see [Tag-based versioning](#tag-based-versioning).
+
+<!-- markdownlint-disable MD013 MD046 -->
+
+```yaml
+# In the verify job, for tag v1.2.3
+- name: "Verify crate"
+  id: verify
+  uses: lfreleng-actions/rust-crate-publish-action@main
+  with:
+    version: '1.2.3'
+    release_tag: 'v1.2.3'
+    toolchain: '1.90.0'
+    dry_run: 'true'
+
+# In the publish job, after authenticating
+- name: "Publish crate"
+  uses: lfreleng-actions/rust-crate-publish-action@main
+  with:
+    version: '1.2.3'
+    toolchain: '1.90.0'
+    registry_token: ${{ steps.auth.outputs.token }}
+    expected_sha256: ${{ needs.verify.outputs.crate_sha256 }}
+```
+
+<!-- markdownlint-enable MD013 MD046 -->
+
 ### Publish to another Cargo registry
 
 Set `registry` to a registry name (as Cargo requires, a letter or `_`
@@ -320,24 +353,25 @@ for crates.io, means the same as an empty `registry`.
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                        | Required | Default      | Description                                                                                                                           |
-| --------------------------- | -------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| path_prefix                 | False    | `.`          | Directory containing the crate or workspace; must resolve within the workspace                                                        |
-| manifest_path               | False    | `Cargo.toml` | Path to the crate's `Cargo.toml`, relative to `path_prefix`; with `workspace` or `packages`, any manifest of the workspace            |
-| workspace                   | False    | `false`      | Publish every workspace member that the target registry accepts, in dependency order                                                  |
-| packages                    | False    |              | Whitespace-separated workspace members to publish, in dependency order; replaces `workspace`                                          |
-| exclude                     | False    |              | Whitespace-separated members to leave out; needs `workspace: true` and an empty `packages`                                            |
-| release_tag                 | False    |              | Release tag that every selected crate's version must match, one leading `v` ignored                                                   |
-| max_crate_size_bytes        | False    | `10485760`   | Largest allowed packaged `.crate` size in bytes; the default matches the crates.io 10MB cap                                           |
-| toolchain                   | False    |              | rustup toolchain for every stage, such as `1.90.0`, installed when missing; empty uses the one `path_prefix` selects                  |
-| dry_run                     | False    | `false`      | Check and package without publishing; needs no credentials                                                                            |
-| registry                    | False    |              | Cargo registry name to publish to; empty or `crates-io` means crates.io. Needs `CARGO_REGISTRIES_<NAME>_INDEX`                        |
-| registry_token              | False    |              | Registry token for the upload alone; empty falls back to the caller's Cargo credentials                                               |
-| expected_sha256             | False    |              | `crate_sha256` from an earlier `dry_run` job, a JSON object for two or more crates; skips compilation and refuses a differing archive |
-| permit_fail                 | False    | `false`      | Report success even when a stage fails                                                                                                |
-| semver_checks               | False    | `false`      | Run `cargo-semver-checks` against the latest earlier crates.io release; crates.io dry runs alone                                      |
-| cargo_semver_checks_version | False    | `0.51.0`     | `cargo-semver-checks` version to install for `semver_checks`                                                                          |
-| summary                     | False    | `true`       | Write a crate table to the job summary                                                                                                |
+| Name                        | Required | Default      | Description                                                                                                                                                |
+| --------------------------- | -------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| path_prefix                 | False    | `.`          | Directory containing the crate or workspace; must resolve within the workspace                                                                             |
+| manifest_path               | False    | `Cargo.toml` | Path to the crate's `Cargo.toml`, relative to `path_prefix`; with `workspace` or `packages`, any manifest of the workspace                                 |
+| workspace                   | False    | `false`      | Publish every workspace member that the target registry accepts, in dependency order                                                                       |
+| packages                    | False    |              | Whitespace-separated workspace members to publish, in dependency order; replaces `workspace`                                                               |
+| exclude                     | False    |              | Whitespace-separated members to leave out; needs `workspace: true` and an empty `packages`                                                                 |
+| release_tag                 | False    |              | Release tag that every selected crate's version must match, one leading `v` ignored                                                                        |
+| version                     | False    |              | SemVer version to write over the placeholder `0.0.0` in `Cargo.toml`; empty uses `Cargo.toml` unchanged. See [Tag-based versioning](#tag-based-versioning) |
+| max_crate_size_bytes        | False    | `10485760`   | Largest allowed packaged `.crate` size in bytes; the default matches the crates.io 10MB cap                                                                |
+| toolchain                   | False    |              | rustup toolchain for every stage, such as `1.90.0`, installed when missing; empty uses the one `path_prefix` selects                                       |
+| dry_run                     | False    | `false`      | Check and package without publishing; needs no credentials                                                                                                 |
+| registry                    | False    |              | Cargo registry name to publish to; empty or `crates-io` means crates.io. Needs `CARGO_REGISTRIES_<NAME>_INDEX`                                             |
+| registry_token              | False    |              | Registry token for the upload alone; empty falls back to the caller's Cargo credentials                                                                    |
+| expected_sha256             | False    |              | `crate_sha256` from an earlier `dry_run` job, a JSON object for two or more crates; skips compilation and refuses a differing archive                      |
+| permit_fail                 | False    | `false`      | Report success even when a stage fails                                                                                                                     |
+| semver_checks               | False    | `false`      | Run `cargo-semver-checks` against the latest earlier crates.io release; crates.io dry runs alone                                                           |
+| cargo_semver_checks_version | False    | `0.51.0`     | `cargo-semver-checks` version to install for `semver_checks`                                                                                               |
+| summary                     | False    | `true`       | Write a crate table to the job summary                                                                                                                     |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -369,9 +403,9 @@ value fails the run.
 
 The action runs these stages in order, and the first failure stops it:
 
-1. **Check inputs**: checks booleans, the size limit and the
-   release tag character set, and confirms that `path_prefix` and
-   `manifest_path` resolve within `GITHUB_WORKSPACE`. A symlinked
+1. **Check inputs**: checks booleans, the size limit, the
+   release tag character set and the `version` format, and confirms
+   that `path_prefix` and `manifest_path` resolve within `GITHUB_WORKSPACE`. A symlinked
    `Cargo.toml` fails, since it could point outside the workspace.
    A named `registry` needs a valid name and a sparse HTTPS index URL.
 2. **Read registry config**: for a named `registry` alone, reads the
@@ -382,6 +416,8 @@ The action runs these stages in order, and the first failure stops it:
    and pins that channel for every later stage. A path-based
    toolchain stops any release; see below. With `toolchain`,
    **Install toolchain** then installs it if rustup lacks it.
+   With `version`, **Stamp version** then writes that version into the
+   checkout; see [Tag-based versioning](#tag-based-versioning).
 4. **Read crate metadata**: `cargo metadata --no-deps` selects the
    package whose manifest matches `manifest_path`, which works for
    workspace members, or the members `workspace` or `packages` select;
@@ -409,7 +445,8 @@ The action runs these stages in order, and the first failure stops it:
 13. **Publish**: unless `dry_run` is `true`, uploads the crate.
 
 Packages go to a target directory the action creates, and it removes
-that directory afterwards, so the checkout stays untouched.
+that directory afterwards, so the checkout stays untouched apart from
+any `version` rewrite.
 
 ### Workspaces
 
@@ -526,6 +563,95 @@ names the selection without running it:
 A dry run with a path toolchain holds no credentials, and no other
 toolchain can reproduce its archives, so it keeps running there.
 Nothing the repository supplies ever runs as the uploading `cargo`.
+
+### Tag-based versioning
+
+A project can take its version from the release tag rather than from
+`Cargo.toml`. Every workspace member then keeps the placeholder
+version `0.0.0` in `Cargo.toml`, and the `version` input names the
+release: a SemVer 2.0 version without a leading `v`, such as `1.2.3`,
+`1.2.3-rc.1` or `1.2.3+build.5`. As SemVer requires, a numeric
+pre-release identifier has no leading zero, so `1.2.3-rc.01` fails
+while `1.2.3-0a` and `1.2.3+001` pass. Anything else fails **Check
+inputs**. With `version` empty, the action reads `Cargo.toml`
+unchanged, so manifest-versioned projects need no change, and the action
+supports both kinds. With `release_tag` set too, `release_tag` less
+one leading `v` must equal `version`, and the tag check then passes
+by construction.
+
+The **Stamp version** stage runs before Cargo packages anything:
+
+1. `cargo metadata --no-deps` must report `0.0.0` for every workspace
+   member, whichever crates the run selects; otherwise the run fails,
+   naming the member and its version.
+2. It rewrites the workspace root's `Cargo.toml`, each member's
+   `Cargo.toml` and the root `Cargo.lock`, when present, and nothing
+   else. Each must be a regular file that, with symlinked directories
+   resolved, lies below the workspace root. In a manifest, the rewrite
+   changes a double-quoted `0.0.0` given to a `version` key, optionally
+   after `=`, `^` or `~`, and nothing more: the `[package]` and
+   `[workspace.package]` versions, and requirements on members in
+   dependency tables or single-line inline tables. `rust-version`,
+   `version.workspace = true` and every other byte stay as they were.
+   The rules read each line without its ending and write it back with
+   that same ending, CRLF, LF or none, so it stamps a checkout
+   with CRLF endings too, as Windows runners make by default. In
+   `Cargo.lock`, it changes `[[package]]` sections alone, each ending at
+   the next line that starts with `[`, and within them the members' own
+   entries and, on any line, dependency references to them, nothing
+   else. A registry crate's entry never changes, even at `0.0.0`, and
+   nor does any other section, such as `[[patch.unused]]`.
+3. `cargo metadata` must then report the new version for every
+   member. A registry dependency declared as `version = "0.0.0"`
+   would be rewritten too; the `--locked` packaging that
+   follows then fails rather than shipping it.
+
+The rewrite is text processing in the action's own script, and runs
+no Cargo command and no project code. Its rules match those of
+[rust-build-action](https://github.com/lfreleng-actions/rust-build-action)
+byte for byte, since a release lane compares the `.crate` that action
+packages with the one this action uploads. Both repositories test the
+rewrite against the same vectors, in `tests/fixtures/version-stamp/`.
+
+Cargo refuses to package a checkout with uncommitted changes, and the
+rewrite makes some. So when git finds a work tree at the workspace root,
+the stage first requires `git status` to report nothing below that root,
+apart from an untracked `Cargo.lock` such as a release lane restores.
+After the rewrite, git must report the rewritten files and nothing else;
+an untracked `Cargo.lock` must then be one the rewrite covered.
+Then, and not before, each `cargo package` and `cargo publish` call gets
+`--allow-dirty`. Since that flag also stops Cargo noticing a later edit,
+the action checks again before it repackages to confirm the archive and
+once more right before the upload. Each rewritten file must still be a
+regular file matching, in content and executable bit, a copy kept after
+the rewrite, and a `Cargo.lock` that appeared since fails the run even
+when git ignores it. Any other change, tracked or untracked,
+fails the run, as Cargo would have failed it; the action checks
+everything below the workspace root, where Cargo checks the files it
+packages and no others. Without `version`, the action never passes
+`--allow-dirty`. Outside a git work tree, it passes no flag either, and
+Cargo applies its own check. git runs with the same variables withheld
+as Cargo.
+
+**Known limitation.** The manifest rule works line by line and does
+not parse TOML. A literal (single-quoted) or multi-line string that
+contains the exact text `version = "0.0.0"` after whitespace, `{` or
+`,` is rewritten too. rust-build-action rewrites it identically, so
+the archives still match, and the guard and the `cargo metadata`
+check after the rewrite still hold. Avoiding it would take a TOML
+parser in both actions.
+
+For the two-job pattern, pass both jobs the same `version` and the
+same exact `toolchain`. The rewrite is deterministic, so both jobs
+package the same archive, and `expected_sha256` holds the publishing
+job to the one the first job verified.
+
+Provenance differs from a manifest-versioned release. The published
+crate comes from a modified checkout: its `.cargo_vcs_info.json`
+names the tagged commit but reports `"dirty": true`, and that
+commit's `Cargo.toml` holds `0.0.0` rather than the published
+version. To rebuild the crate from the tag, apply the same rewrite,
+for instance by running this action with the same `version`.
 
 ### Already published versions
 
@@ -826,8 +952,10 @@ never reached read "Not reached". A crate published to or skipped on
 crates.io links to its crates.io page; for a named registry, the
 summary names the registry and gives no link. With `semver_checks`, a
 **Semver** row reports the check. The **Toolchain** row says whether
-the `toolchain` input or the project chose the toolchain. The summary
-never includes credentials.
+the `toolchain` input or the project chose the toolchain. With
+`version`, a **Version** row reads, for example, `1.2.3 (version
+input; Cargo.toml holds 0.0.0)`. The summary never includes
+credentials.
 
 ## Testing
 

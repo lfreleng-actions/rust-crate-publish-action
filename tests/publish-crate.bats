@@ -22,8 +22,11 @@ setup() {
   project="$workdir/member crate"
   mkdir -p "$workdir/bin" "$project" "$workdir/cargo home" \
     "$workdir/runner temp"
+  # The git stand-in logs each call, then runs the real git.
+  MOCK_REAL_GIT="$(command -v git)"
+  export MOCK_REAL_GIT
   local tool
-  for tool in cargo rustup curl; do
+  for tool in cargo rustup curl git; do
     cp "$BATS_TEST_DIRNAME/fixtures/$tool.sh" "$workdir/bin/$tool"
     chmod +x "$workdir/bin/$tool"
   done
@@ -50,6 +53,9 @@ setup() {
   export MOCK_MANIFEST_JSON="$workdir/manifest.json"
   cp "$BATS_TEST_DIRNAME/fixtures/manifest.json" "$MOCK_MANIFEST_JSON"
   export MOCK_CRATE_SIZE=32
+  export MOCK_STAMP_JSON="$workdir/stamp.json"
+  # Only the repositories the tests create, never one around them.
+  export GIT_CEILING_DIRECTORIES="$workdir"
   unset INPUT_MANIFEST_PATH INPUT_RELEASE_TAG INPUT_MAX_CRATE_SIZE_BYTES
   unset INPUT_DRY_RUN INPUT_PERMIT_FAIL INPUT_SUMMARY INPUT_REGISTRY_TOKEN
   unset INPUT_EXPECTED_SHA256
@@ -67,6 +73,8 @@ setup() {
   unset MOCK_RACE_CKSUM MOCK_INDEX_DIR_MISSING
   unset INPUT_TOOLCHAIN MOCK_RUSTUP_INSTALL_FAIL RUSTUP_AUTO_INSTALL
   unset MOCK_TOOLCHAIN_REASON
+  unset INPUT_VERSION MOCK_STAMP_ROOT MOCK_STAMP_MEMBERS
+  unset MOCK_EXPECT_ALLOW_DIRTY MOCK_PACKAGE_WRITES
   # Host registry settings would reach the stand-ins and break the exact
   # scrub assertions.
   local name
@@ -2507,4 +2515,578 @@ staging_entry() {
     | awk '$2 != "" { print $2 }' | sort -u)"
   [ "$declared" = "$written" ]
   [ "$(grep -c 'steps.publish.outputs.' "$action_file")" -eq "$(printf '%s\n' "$declared" | wc -l)" ]
+}
+
+### Version input ###
+
+# Calls of a stamped dry run in a git checkout: the guard's metadata,
+# git's check before the rewrite, the confirming metadata and git's
+# check after it, all before the first package call, and git's check
+# again before the repackaging.
+readonly stamped_dry_run_calls=$'version\nmetadata\ngit-rev-parse\ngit-status\nmetadata\ngit-status\nmetadata\npackage\ndry-run\ngit-status\nrepackage'
+readonly vector_dir="$BATS_TEST_DIRNAME/fixtures/version-stamp"
+
+# git on the test repositories, free of user and system configuration.
+fixture_git() {
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 "$MOCK_REAL_GIT" \
+    -c user.name=Test -c user.email=test@example.com \
+    -c commit.gpgsign=false -c init.defaultBranch=main -C "$project" "$@"
+}
+
+# Commit the project directory as its own repository.
+commit_project() {
+  fixture_git init -q
+  fixture_git add -A
+  fixture_git commit -q -m fixture
+}
+
+# The single crate, holding the placeholder version, stamped with
+# VERSION (default 1.2.3).
+stamp_crate() {
+  sed 's/^version = "1.2.3"$/version = "0.0.0"/' \
+    "$BATS_TEST_DIRNAME/fixtures/Cargo.toml" > "$project/Cargo.toml"
+  export MOCK_STAMP_ROOT="$project" MOCK_STAMP_MEMBERS="example-crate:."
+  export MOCK_EXPECT_PACKAGE_MANIFEST="$project/Cargo.toml"
+  export INPUT_VERSION="${1:-1.2.3}" INPUT_DRY_RUN=true
+}
+
+# A shared vector set's workspace (default the main set), as the
+# project.
+stamp_vectors() {
+  cp -R "${1:-$vector_dir}/input/." "$project/"
+  export MOCK_STAMP_ROOT="$project"
+  export MOCK_STAMP_MEMBERS="demo-core:core demo-cli:cli demo-tool:tool"
+  export MOCK_INDEX_DIR="$workdir/index"
+  mkdir -p "$MOCK_INDEX_DIR"
+  export INPUT_VERSION=1.2.3-rc.1+build.5 INPUT_WORKSPACE=true
+  export INPUT_DRY_RUN=true
+}
+
+# Every file of a vector set's expected tree matches the project's
+# byte for byte.
+assert_vector_set() {
+  local file
+  while IFS= read -r file; do
+    cmp -- "$1/expected/$file" "$project/$file"
+  done < <(cd "$1/expected" && find . -type f | sort)
+}
+
+@test "version rejects anything but a SemVer version, without echoing it" {
+  local bad
+  for bad in v1.2.3 1.2 1.2.3.4 01.2.3 1.02.3 1.2.3- 1.2.3+ 1.2.3-rc..1 \
+    1.2.3-01 1.2.3-rc.01 1.2.3-rc.1.00 1.2.3_1 ' 1.2.3' '1.2.3 ' 1.2.3-rc.1+b+c $'1.2.3\n::error::injected'; do
+    export INPUT_VERSION="$bad"
+    reset_logs
+    run_action
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"::error::version must be a SemVer 2.0 version such as 1.2.3 or 1.2.3-rc.1, without a leading 'v'"* ]]
+    [[ "$output" != *injected* ]]
+    assert_no_cargo
+  done
+}
+
+@test "version accepts pre-release and build metadata, and outputs it" {
+  local good
+  stamp_crate
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  for good in 0.1.0 10.20.30 1.2.3-rc.1 1.0.0-alpha-a.b-c 1.0.0-0.3.7 \
+    1.2.3-0 1.2.3-0a 1.2.3-rc.10 1.2.3+001 1.2.3+build.5 1.2.3-rc.1+build.5 1.0.0+20260101.sha-5114f85; do
+    fixture_git checkout -q -- .
+    export INPUT_VERSION="$good"
+    reset_logs
+    run_action
+    [ "$status" -eq 0 ]
+    [ "$(output_value crate_version)" = "$good" ]
+    grep -Fqx "version = \"$good\"" "$project/Cargo.toml"
+  done
+}
+
+@test "a stamped dry run packages with --allow-dirty only after git's check" {
+  stamp_crate
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls "$stamped_dry_run_calls"
+  [ "$(output_value crate_version)" = 1.2.3 ]
+  [ "$(fixture_git status --porcelain)" = " M Cargo.toml" ]
+  [ "$(fixture_git diff --numstat)" = $'1\t1\tCargo.toml' ]
+  grep -Fqx 'version = "1.2.3"' "$project/Cargo.toml"
+  grep -Fq '| Version | 1.2.3 (version input; Cargo.toml holds 0.0.0) |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "the rewrite keeps every other byte, line endings included" {
+  stamp_crate
+  printf '[package]\r\nname = "example-crate"\r\nversion = "0.0.0"\r\nedition = "2021"' \
+    > "$project/Cargo.toml"
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  printf '[package]\r\nname = "example-crate"\r\nversion = "1.2.3"\r\nedition = "2021"' \
+    > "$workdir/expected.toml"
+  cmp -- "$workdir/expected.toml" "$project/Cargo.toml"
+}
+
+@test "the manifest rule reaches tight inline tables and nothing else" {
+  stamp_crate
+  cat >> "$project/Cargo.toml" << 'TOML'
+rust-version = "0.0.0"
+
+[dependencies]
+a = {version="0.0.0",path="a"}
+b = {path="b",version="~0.0.0"}
+c = {path="c",xversion="0.0.0"}
+d = { path = "d", version = ">=0.0.0" }
+e = "0.0.0"
+TOML
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(fixture_git diff -U0 | grep '^[-+][^-+]')" = "$(printf '%s\n' \
+    '-version = "0.0.0"' '+version = "1.2.3"' \
+    '-a = {version="0.0.0",path="a"}' '-b = {path="b",version="~0.0.0"}' \
+    '+a = {version="1.2.3",path="a"}' '+b = {path="b",version="~1.2.3"}')" ]
+}
+
+@test "a registry crate sharing a member's name keeps its lockfile entry" {
+  local block
+  stamp_vectors
+  block='
+[[package]]
+name = "demo-tool"
+version = "0.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2222222222222222222222222222222222222222222222222222222222222222"
+dependencies = [
+ "demo-core 0.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]'
+  printf '%s\n' "$block" >> "$project/Cargo.lock"
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  { cat "$vector_dir/expected/Cargo.lock"; printf '%s\n' "$block"; } \
+    > "$workdir/expected.lock"
+  cmp -- "$workdir/expected.lock" "$project/Cargo.lock"
+}
+
+@test "a single-line dependencies array is stamped too" {
+  local block
+  stamp_vectors
+  block='
+[[package]]
+name = "demo-extra"
+version = "0.1.0"
+dependencies = ["demo-core 0.0.0", "semver", "demo-tool 0.0.0"]'
+  printf '%s\n' "$block" >> "$project/Cargo.lock"
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  {
+    cat "$vector_dir/expected/Cargo.lock"
+    printf '%s' "${block%%dependencies*}"
+    printf 'dependencies = ["demo-core %s", "semver", "demo-tool %s"]\n' \
+      "$INPUT_VERSION" "$INPUT_VERSION"
+  } > "$workdir/expected.lock"
+  cmp -- "$workdir/expected.lock" "$project/Cargo.lock"
+}
+
+@test "a lockfile section other than [[package]] keeps its text" {
+  local block
+  stamp_vectors
+  # Shaped like a member's entry, but no [[package]] section: neither
+  # its version nor its dependency entry changes.
+  block='
+[[patch.unused]]
+name = "demo-core"
+version = "0.0.0"
+dependencies = [
+ "demo-tool 0.0.0",
+]'
+  printf '%s\n' "$block" >> "$project/Cargo.lock"
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  { cat "$vector_dir/expected/Cargo.lock"; printf '%s\n' "$block"; } \
+    > "$workdir/expected.lock"
+  cmp -- "$workdir/expected.lock" "$project/Cargo.lock"
+}
+
+@test "the shared vector workspace is stamped byte for byte" {
+  stamp_vectors
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_vector_set "$vector_dir"
+  # Exactly the files the rule changes, and nothing else.
+  [ "$(fixture_git status --porcelain)" = "$(printf ' M %s\n' Cargo.lock \
+    Cargo.toml cli/Cargo.toml tool/Cargo.toml)" ]
+  # A third-party crate whose version is literally 0.0.0 keeps it.
+  [ "$(sed -n '/^name = "zero"$/{n;p;}' "$project/Cargo.lock")" \
+    = 'version = "0.0.0"' ]
+  # demo-tool is publish = false; the other two are packaged as a set.
+  [ "$(output_value crate_version | jq -c 'to_entries | map(.value) | unique')" \
+    = '["1.2.3-rc.1+build.5"]' ]
+  grep -Fq 'package demo-' "$MOCK_CARGO_SETS"
+  grep -Fq '| Version | 1.2.3-rc.1+build.5 (version input; Cargo.toml holds 0.0.0) |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "a member reached through a symlinked directory stays contained" {
+  local target message
+  stamp_crate
+  sed 's/^name = .*/name = "linked-crate"/' "$project/Cargo.toml" \
+    > "$workdir/linked.toml"
+  # Outside the workspace, then inside it but outside the workspace
+  # root: cargo reports the member's manifest through the symlink.
+  for target in "$BATS_TEST_TMPDIR/outside:must resolve within the workspace" \
+    "$workdir/sibling:below the workspace root"; do
+    message="${target#*:}"
+    target="${target%%:*}"
+    rm -rf "$project/.git" "$project/linked" "$target"
+    mkdir -p "$target"
+    cp "$workdir/linked.toml" "$target/Cargo.toml"
+    ln -s "$target" "$project/linked"
+    export MOCK_STAMP_MEMBERS="example-crate:. linked-crate:linked"
+    commit_project
+    reset_logs
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"::error::"*"$message"* ]]
+    cmp -- "$workdir/linked.toml" "$target/Cargo.toml"
+    grep -Fqx 'version = "0.0.0"' "$project/Cargo.toml"
+  done
+}
+
+@test "a final line without a newline keeps a CR as its content" {
+  local block
+  stamp_vectors
+  # No newline ends this line, so the CR belongs to it, and it does not
+  # read exactly version = "0.0.0".
+  block=$'\n[[package]]\nname = "demo-tool"\nversion = "0.0.0"\r'
+  printf '%s' "$block" >> "$project/Cargo.lock"
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  { cat "$vector_dir/expected/Cargo.lock"; printf '%s' "$block"; } \
+    > "$workdir/expected.lock"
+  cmp -- "$workdir/expected.lock" "$project/Cargo.lock"
+}
+
+@test "the shared CRLF vector workspace keeps every line ending" {
+  stamp_vectors "$vector_dir-crlf"
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_vector_set "$vector_dir-crlf"
+}
+
+@test "the shared single-line array vector workspace is stamped" {
+  stamp_vectors "$vector_dir-inline"
+  export MOCK_STAMP_MEMBERS="demo-a:. demo-b:b" INPUT_VERSION=2.0.0
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_vector_set "$vector_dir-inline"
+}
+
+@test "version must agree with release_tag" {
+  stamp_crate
+  commit_project
+  local tag
+  for tag in v1.2.4 1.2.4 vv1.2.3 V1.2.3; do
+    export INPUT_RELEASE_TAG="$tag"
+    reset_logs
+    run_action
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"::error::release_tag and version disagree: release_tag, less one leading 'v', must equal version"* ]]
+    assert_no_cargo
+  done
+
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  for tag in v1.2.3 1.2.3; do
+    fixture_git checkout -q -- .
+    export INPUT_RELEASE_TAG="$tag"
+    reset_logs
+    run_action
+    [ "$status" -eq 0 ]
+    grep -Fq "| Release tag | ✅ <code>$tag</code> matches |" \
+      "$GITHUB_STEP_SUMMARY"
+  done
+}
+
+@test "every workspace member must carry the placeholder" {
+  stamp_vectors
+  sed -i.orig 's/^version =   "0.0.0"$/version =   "0.4.0"/' \
+    "$project/tool/Cargo.toml"
+  rm "$project/tool/Cargo.toml.orig"
+  commit_project
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::version is set, so every workspace member must carry the placeholder version 0.0.0 in Cargo.toml; demo-tool carries 0.4.0"* ]]
+  assert_calls $'version\nmetadata'
+  [ -z "$(fixture_git status --porcelain)" ]
+  grep -Fq '| Version | ❌ <code>demo-tool</code> carries <code>0.4.0</code>, not <code>0.0.0</code> |' \
+    "$GITHUB_STEP_SUMMARY"
+
+  # A manifest-versioned crate given a version fails the same way.
+  cp "$BATS_TEST_DIRNAME/fixtures/Cargo.toml" "$project/Cargo.toml"
+  export MOCK_STAMP_MEMBERS="example-crate:." INPUT_WORKSPACE=false
+  reset_logs
+  run_action
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"; example-crate carries 1.2.3"* ]]
+}
+
+@test "any other change fails the stamped run and leaves the checkout alone" {
+  stamp_crate
+  printf 'docs\n' > "$project/README.md"
+  commit_project
+
+  # Untracked, modified, or the manifest itself modified beforehand.
+  local change
+  for change in untracked modified manifest; do
+    fixture_git checkout -q -- .
+    rm -f "$project/notes.txt"
+    case "$change" in
+      untracked) printf 'x\n' > "$project/notes.txt" ;;
+      modified) printf 'more\n' >> "$project/README.md" ;;
+      manifest) printf '# local edit\n' >> "$project/Cargo.toml" ;;
+    esac
+    reset_logs
+    run_action
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"::error::version is set, but the checkout holds 1 change(s) besides the version rewrite below the workspace root, listed in the step log; Cargo would refuse to package them, so commit or remove them"* ]]
+    assert_calls $'version\nmetadata\ngit-rev-parse\ngit-status'
+    grep -Fqx 'version = "0.0.0"' "$project/Cargo.toml"
+  done
+  [[ "$output" == *"Changed: Cargo.toml (git status \\ M)"* ]]
+}
+
+@test "a path naming a workflow command is listed inertly" {
+  stamp_crate
+  commit_project
+  : > "$project/::warning::forged"
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Changed: ::warning::forged"* ]]
+  [ "$(grep -c "^::warning::forged" <<< "$output")" -eq 0 ]
+}
+
+@test "an untracked Cargo.lock, as a release lane restores, is stamped" {
+  stamp_vectors
+  commit_project
+  fixture_git rm -q --cached Cargo.lock
+  fixture_git commit -q -m 'untrack the lockfile'
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  cmp -- "$vector_dir/expected/Cargo.lock" "$project/Cargo.lock"
+  [[ "$(fixture_git status --porcelain)" == *"?? Cargo.lock"* ]]
+}
+
+@test "a change made while Cargo verifies stops the run before repackaging" {
+  stamp_crate
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true MOCK_PACKAGE_WRITES="$project/build.rs"
+  run_action
+
+  [ "$status" -eq 1 ]
+  assert_calls $'version\nmetadata\ngit-rev-parse\ngit-status\nmetadata\ngit-status\nmetadata\npackage\ndry-run\ngit-status'
+  [[ "$output" == *"Changed: build.rs"* ]]
+  grep -Fq 'Failed at Confirm package unchanged' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "a later change to a rewritten file stops the run, the upload too" {
+  stamp_crate
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  # git reports the rewritten Cargo.toml as modified either way, so
+  # only its stamped copy shows the change.
+  MOCK_PACKAGE_WRITES="$project/Cargo.toml" run_action
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::member crate/Cargo.toml changed after the version rewrite"* ]]
+  grep -Fq 'Failed at Confirm package unchanged' "$GITHUB_STEP_SUMMARY"
+
+  fixture_git checkout -q -- .
+  export INPUT_DRY_RUN=false
+  reset_logs
+  MOCK_REPACKAGE_WRITES="$project/Cargo.toml" run_action
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::member crate/Cargo.toml changed after the version rewrite"* ]]
+  grep -Fq 'Failed at Publish' "$GITHUB_STEP_SUMMARY"
+  run ! grep -qx publish "$MOCK_CARGO_LOG"
+}
+
+@test "a later change to a rewritten file stops a crate set's upload" {
+  stamp_vectors
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true INPUT_DRY_RUN=false
+  MOCK_REPACKAGE_WRITES="$project/Cargo.lock" run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::member crate/Cargo.lock changed after the version rewrite"* ]]
+  grep -Fq 'Failed at Publish' "$GITHUB_STEP_SUMMARY"
+  run ! grep -qx publish "$MOCK_CARGO_LOG"
+}
+
+@test "a path holding a newline cannot pass for a rewritten file" {
+  # Two rewritten paths joined by a newline name a third file.
+  local forged="Cargo.toml"$'\n'"core/Cargo.toml"
+  stamp_vectors
+  mkdir "$project/${forged%/*}"
+  printf 'x\n' > "$project/$forged"
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true MOCK_PACKAGE_WRITES="$project/$forged"
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Changed: \$'Cargo.toml\\ncore/Cargo.toml' (git status \\ M)"* ]]
+  grep -Fq 'Failed at Confirm package unchanged' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "an untracked Cargo.lock that appears after the rewrite stops the run" {
+  stamp_crate
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  MOCK_PACKAGE_RUNS="printf 'x\\n' > '$project/Cargo.lock'" run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Changed: Cargo.lock (git status \\?\\?)"* ]]
+  grep -Fq 'Failed at Confirm package unchanged' "$GITHUB_STEP_SUMMARY"
+}
+
+@test "a member manifest outside the workspace root fails before any rewrite" {
+  stamp_crate
+  mkdir "$workdir/sibling"
+  sed 's/^name = .*/name = "sibling-crate"/' "$project/Cargo.toml" \
+    > "$workdir/sibling/Cargo.toml"
+  cp "$workdir/sibling/Cargo.toml" "$workdir/sibling.toml"
+  export MOCK_STAMP_MEMBERS="example-crate:. sibling-crate:../sibling"
+  commit_project
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::version needs every member's manifest below the workspace root"* ]]
+  cmp -- "$workdir/sibling.toml" "$workdir/sibling/Cargo.toml"
+  grep -Fqx 'version = "0.0.0"' "$project/Cargo.toml"
+}
+
+@test "a rewritten file's mode or type changed later stops the run" {
+  local change
+  stamp_crate
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  # git reports either as a change to a rewritten file, so only the
+  # comparison with its stamped copy shows it.
+  for change in "chmod +x '$project/Cargo.toml'" \
+    "cp '$project/Cargo.toml' '$workdir/same.toml' && ln -sf '$workdir/same.toml' '$project/Cargo.toml'"; do
+    rm -f "$project/Cargo.toml"
+    fixture_git checkout -q -- .
+    reset_logs
+    MOCK_PACKAGE_RUNS="$change" run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"::error::member crate/Cargo.toml changed after the version rewrite"* ]]
+    grep -Fq 'Failed at Confirm package unchanged' "$GITHUB_STEP_SUMMARY"
+  done
+}
+
+@test "a Cargo.lock git ignores must be the one the rewrite stamped" {
+  stamp_crate
+  printf 'Cargo.lock\n' > "$project/.gitignore"
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  MOCK_PACKAGE_RUNS="printf 'x\\n' > '$project/Cargo.lock'" run_action
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::Cargo.lock appeared after the version rewrite; packaging it needs --allow-dirty, which would let it through unchecked"* ]]
+  grep -Fq 'Failed at Confirm package unchanged' "$GITHUB_STEP_SUMMARY"
+
+  # One present beforehand is stamped and kept like any other.
+  fixture_git checkout -q -- .
+  printf '[[package]]\nname = "example-crate"\nversion = "0.0.0"\n' \
+    > "$project/Cargo.lock"
+  reset_logs
+  MOCK_PACKAGE_WRITES="$project/Cargo.lock" run_action
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::member crate/Cargo.lock changed after the version rewrite"* ]]
+}
+
+@test "outside a git work tree a stamped run leaves Cargo's own check on" {
+  stamp_crate
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls $'version\nmetadata\ngit-rev-parse\nmetadata\nmetadata\npackage\ndry-run\nrepackage'
+  [[ "$output" == *"git sees no work tree at the workspace root, so Cargo checks the checkout itself and packages without --allow-dirty"* ]]
+  [ "$(output_value crate_version)" = 1.2.3 ]
+}
+
+@test "a stamped verify run's digest feeds a stamped publish of a fresh checkout" {
+  stamp_crate
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+  [ "$status" -eq 0 ]
+
+  fixture_git checkout -q -- .
+  INPUT_EXPECTED_SHA256="$(output_value crate_sha256)"
+  export INPUT_EXPECTED_SHA256 INPUT_DRY_RUN=false
+  reset_logs
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls $'version\nmetadata\ngit-rev-parse\ngit-status\nmetadata\ngit-status\nmetadata\nrepackage\ndry-run\ngit-status\nrepackage\ngit-status\npublish'
+  [ "$(output_value crate_sha256)" = "$INPUT_EXPECTED_SHA256" ]
+  [ "$(output_value publish_status)" = published ]
+}
+
+@test "git runs under the same scrub as cargo" {
+  export_scrubbed_variables
+  stamp_crate
+  commit_project
+  export MOCK_EXPECT_ALLOW_DIRTY=true
+  run_action
+
+  [ "$status" -eq 0 ]
+  local kept="CARGO_REGISTRIES_PRIVATE_INDEX=sparse+https://private.example/ "
+  [ "$(stage_vars git-rev-parse)" = "$kept" ]
+  [ "$(stage_vars git-status | sort -u)" = "$kept" ]
+}
+
+@test "a version the rewrite cannot reach fails once Cargo reads it" {
+  stamp_vectors
+  sed -i.orig "s/^version =   \"0.0.0\"\$/version = '0.0.0'/" \
+    "$project/tool/Cargo.toml"
+  rm "$project/tool/Cargo.toml.orig"
+  commit_project
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::after the version rewrite, demo-tool reports version 0.0.0 rather than the version input"* ]]
+  grep -Fq 'Failed at Stamp version' "$GITHUB_STEP_SUMMARY"
 }
