@@ -45,6 +45,7 @@ setup() {
   unset INPUT_WORKSPACE INPUT_PACKAGES INPUT_EXCLUDE MOCK_WORKSPACE_JSON
   unset MOCK_EXPECT_PACKAGE_MANIFEST MOCK_INDEX_DIR MOCK_CARGO_SETS
   unset MOCK_INDEX_DIR_MISSING MOCK_SEMVER_CALLS MOCK_SEMVER_FAIL_PACKAGE
+  unset INPUT_TOOLCHAIN RUSTUP_AUTO_INSTALL
   # Any host registry token would trip the credential refusal, and other
   # registry settings would reach the stand-ins.
   for name in $(compgen -e); do
@@ -908,6 +909,16 @@ wrap_stand_in() {
   semver_env "CARGO_HOME=$tmp/cargo home"
   grep -q "^CARGO_TARGET_DIR=$RUNNER_TEMP/rust-crate-publish\.[^/]*/semver-target$" \
     "$MOCK_SEMVER_ENV"
+}
+
+@test "runs pinned to the toolchain input" {
+  serve_index 1.2.0 false
+  export MOCK_TOOLCHAIN=1.93.0-x86_64-unknown-linux-gnu INPUT_TOOLCHAIN=1.95.0
+
+  publish
+
+  [ "$status" -eq 0 ]
+  semver_env "RUSTUP_TOOLCHAIN=1.95.0"
 }
 
 # cargo-semver-checks resolves crates.io through the source replacement

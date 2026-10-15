@@ -38,7 +38,9 @@ the crate with no credentials in reach. The `publish` job holds the
 token but compiles nothing: given `expected_sha256`, it refuses any
 archive that differs from the one `verify` checked. See
 [Credential handling](#credential-handling) for why this separation
-matters.
+matters. Both jobs pass the same exact `toolchain`: Cargo releases
+package the same sources differently, so a different Cargo in the
+`publish` job would produce an archive that `expected_sha256` refuses.
 
 <!-- markdownlint-disable MD013 MD046 -->
 
@@ -48,6 +50,10 @@ on:
     types: [published]
 
 permissions: {}
+
+env:
+  # One exact release for both jobs
+  RUST_TOOLCHAIN: '1.90.0'
 
 jobs:
   verify:
@@ -65,6 +71,7 @@ jobs:
         id: verify
         uses: lfreleng-actions/rust-crate-publish-action@main
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           release_tag: ${{ github.event.release.tag_name }}
           dry_run: 'true'
 
@@ -88,6 +95,7 @@ jobs:
       - name: "Publish crate"
         uses: lfreleng-actions/rust-crate-publish-action@main
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           release_tag: ${{ github.event.release.tag_name }}
           registry_token: ${{ steps.auth.outputs.token }}
           expected_sha256: ${{ needs.verify.outputs.crate_sha256 }}
@@ -279,12 +287,16 @@ for crates.io, means the same as an empty `registry`.
 - Bash, `cargo`, `jq`, `curl`, `mktemp`, and `sha256sum` or `shasum`
   on the runner. GitHub-hosted runners include them; the action
   fails with a clear error naming any missing tool.
-- A rustup channel toolchain, if the project selects one through a
-  `rust-toolchain` file. The action refuses to upload with a
-  path-based toolchain; see
+- A rustup toolchain, unless the runner's `cargo` is to package the
+  crate as it stands. The `toolchain` input names one, such as
+  `1.90.0`, and the action installs it when missing; otherwise the
+  action uses the channel the project selects through a
+  `rust-toolchain` file, or rustup's default. The action refuses to
+  upload with a path-based toolchain; see
   [Toolchain and configuration](#toolchain-and-configuration). For the
-  two-job pattern, pin an exact channel such as `1.98.1`, because
-  different Cargo versions package the same sources differently.
+  two-job pattern, pass both jobs the same exact version in
+  `toolchain`, because different Cargo versions package the same
+  sources differently.
 - A clean git checkout. Cargo refuses to package files that git
   reports as uncommitted.
 - A committed `Cargo.lock` for crates with dependencies, since every
@@ -317,6 +329,7 @@ for crates.io, means the same as an empty `registry`.
 | exclude                     | False    |              | Whitespace-separated members to leave out; needs `workspace: true` and an empty `packages`                                            |
 | release_tag                 | False    |              | Release tag that every selected crate's version must match, one leading `v` ignored                                                   |
 | max_crate_size_bytes        | False    | `10485760`   | Largest allowed packaged `.crate` size in bytes; the default matches the crates.io 10MB cap                                           |
+| toolchain                   | False    |              | rustup toolchain for every stage, such as `1.90.0`, installed when missing; empty uses the one `path_prefix` selects                  |
 | dry_run                     | False    | `false`      | Check and package without publishing; needs no credentials                                                                            |
 | registry                    | False    |              | Cargo registry name to publish to; empty or `crates-io` means crates.io. Needs `CARGO_REGISTRIES_<NAME>_INDEX`                        |
 | registry_token              | False    |              | Registry token for the upload alone; empty falls back to the caller's Cargo credentials                                               |
@@ -342,6 +355,8 @@ value fails the run.
 | crate_size_bytes | Packaged `.crate` file size in bytes; two or more crates: a JSON object of name to size                                     |
 | crate_sha256     | SHA-256 of the verified `.crate`, as the registry index records it; two or more crates: a JSON object of name to digest     |
 | cargo_version    | Cargo version that packaged the crate                                                                                       |
+| toolchain        | Toolchain used: the `toolchain` input, or the rustup channel or path `path_prefix` selects; empty without rustup            |
+| toolchain_kind   | How the action chose the toolchain: `channel`, `path` or `none` (no rustup)                                                 |
 | registry_status  | This version on the target registry: `absent`, `identical` (same archive) or `different`; two or more crates: a JSON object |
 | publish_status   | Outcome: `published` (any crate uploaded), `skipped` (every archive already there), `dry-run` or `failed`                   |
 | published        | `true` when this run uploaded a crate, even before a later failure; `false` for a skip too                                  |
@@ -362,9 +377,11 @@ The action runs these stages in order, and the first failure stops it:
 2. **Read registry config**: for a named `registry` alone, reads the
    index's `config.json` and requires an HTTPS `api` URL and no
    `auth-required`.
-3. **Check toolchain**: asks rustup which toolchain the project
-   selects, without running it, and pins that channel for every later
-   stage. A path-based toolchain stops any release; see below.
+3. **Check toolchain**: takes the `toolchain` input, or else asks
+   rustup which toolchain the project selects, without running it,
+   and pins that channel for every later stage. A path-based
+   toolchain stops any release; see below. With `toolchain`,
+   **Install toolchain** then installs it if rustup lacks it.
 4. **Read crate metadata**: `cargo metadata --no-deps` selects the
    package whose manifest matches `manifest_path`, which works for
    workspace members, or the members `workspace` or `packages` select;
@@ -475,18 +492,32 @@ the project directory, where the project's build configuration and
 toolchain belong. Every other stage, the upload included, runs from
 an empty directory, so no checked-in configuration reaches it.
 
-The action pins the toolchain the project selects, provided rustup
-manages it. `rustup show active-toolchain` names the selection
-without running it:
+The action pins one rustup toolchain for every stage, through
+`RUSTUP_TOOLCHAIN`, which outranks any toolchain file. A `toolchain`
+input names it outright. It must be a rustup toolchain name, such as
+`1.90.0`, `stable` or `nightly-2026-01-01`: letters, digits and
+`. _ + -`, starting with a letter or digit, so it can never name a
+path. When rustup lacks it, the action runs
+`rustup toolchain install <toolchain> --profile minimal
+--no-self-update` from the empty directory, with the same variables
+withheld as from Cargo; a name rustup cannot install fails the run.
+The action uses an installed toolchain unchanged, so `stable` stays
+at whatever release the runner has: name an exact version to fix the
+Cargo release, as the two-job pattern needs.
+
+Without the input, the action pins the toolchain the project
+selects, provided rustup manages it. `rustup show active-toolchain`
+names the selection without running it:
 
 <!-- markdownlint-disable MD013 -->
 
 <!-- markdownlint-disable MD013 MD060 -->
 
-| Project selects       | Plain dry run                           | Dry run with `release_tag`    | Upload                        |
-| --------------------- | --------------------------------------- | ----------------------------- | ----------------------------- |
-| A channel, or nothing | Pinned for every stage                  | Pinned for every stage        | Pinned for every stage        |
-| A path                | ⚠️ Warns; runs in the project directory | ❌ Fails before running Cargo | ❌ Fails before running Cargo |
+| Project selects                    | Plain dry run                           | Dry run with `release_tag`    | Upload                        |
+| ---------------------------------- | --------------------------------------- | ----------------------------- | ----------------------------- |
+| Anything, with a `toolchain` input | The input, pinned for every stage       | The input, pinned             | The input, pinned             |
+| A channel, or nothing              | Pinned for every stage                  | Pinned for every stage        | Pinned for every stage        |
+| A path                             | ⚠️ Warns; runs in the project directory | ❌ Fails before running Cargo | ❌ Fails before running Cargo |
 
 <!-- markdownlint-enable MD013 MD060 -->
 
@@ -742,8 +773,9 @@ release, with no fallback to other download methods.
 `cargo_semver_checks_version` must name a version that the pinned
 install-action release lists. `cargo-semver-checks` reads rustdoc JSON, an unstable
 format, so each release supports a range of Rust versions: 0.51.0
-needs Rust 1.93 or newer. A project that pins an older toolchain
-needs an older `cargo_semver_checks_version`.
+needs Rust 1.93 or newer. A project that pins an older toolchain, in
+a toolchain file or the `toolchain` input, needs an older
+`cargo_semver_checks_version`.
 
 ### Failure handling
 
@@ -771,16 +803,16 @@ warnings, Cargo's own included. For example:
 
 <!-- markdownlint-disable MD013 MD060 -->
 
-| Check        | Result                                                                        |
-| ------------ | ----------------------------------------------------------------------------- |
-| Mode         | Dry run: nothing uploaded                                                     |
-| Manifest     | <code>test-rust-project/Cargo.toml</code>                                     |
-| Toolchain    | <code>cargo 1.98.1</code> via <code>stable-x86_64-unknown-linux-gnu</code>    |
-| Release tag  | ✅ <code>v0.1.0</code> matches                                                |
-| Verification | ✅ Compiled and verified in this job                                          |
-| Package size | ✅ 6.8 KiB of the 10.0 MiB limit                                              |
-| crates.io    | ✅ Version not yet published                                                  |
-| SHA-256      | <code>3c8bdba0cee1a8887ae312331ca76aff760f3d4e82787aefd71ae848aee6176e</code> |
+| Check        | Result                                                                               |
+| ------------ | ------------------------------------------------------------------------------------ |
+| Mode         | Dry run: nothing uploaded                                                            |
+| Manifest     | <code>test-rust-project/Cargo.toml</code>                                            |
+| Toolchain    | <code>cargo 1.98.1</code> via <code>stable-x86_64-unknown-linux-gnu</code> (project) |
+| Release tag  | ✅ <code>v0.1.0</code> matches                                                       |
+| Verification | ✅ Compiled and verified in this job                                                 |
+| Package size | ✅ 6.8 KiB of the 10.0 MiB limit                                                     |
+| crates.io    | ✅ Version not yet published                                                         |
+| SHA-256      | <code>3c8bdba0cee1a8887ae312331ca76aff760f3d4e82787aefd71ae848aee6176e</code>        |
 
 <!-- markdownlint-enable MD013 MD060 -->
 ```
@@ -793,8 +825,9 @@ published, ✅ dry run passed, and ❌ failed at a named stage, with
 never reached read "Not reached". A crate published to or skipped on
 crates.io links to its crates.io page; for a named registry, the
 summary names the registry and gives no link. With `semver_checks`, a
-**Semver** row reports the check. The summary never includes
-credentials.
+**Semver** row reports the check. The **Toolchain** row says whether
+the `toolchain` input or the project chose the toolchain. The summary
+never includes credentials.
 
 ## Testing
 
@@ -813,6 +846,9 @@ credentials.
 - Release safeguards against real rustup and the live crates.io
   index: a path-based toolchain, and a version already published
   with different content.
+- A `toolchain` input naming an exact release other than the
+  runner's default, installed through real rustup, overriding a
+  project toolchain file in both jobs of the two-job pattern.
 
 Run the unit tests locally with Bats 1.7.0 or later:
 
