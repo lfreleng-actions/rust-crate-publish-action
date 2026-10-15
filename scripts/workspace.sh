@@ -342,7 +342,8 @@ publish_crate_set() {
         fail "${set_names[i]} package does not match its" \
           "expected_sha256 entry; not publishing. This job packaged it" \
           "with cargo $cargo_version; if the verifying job's" \
-          "cargo_version output differs, pin an exact toolchain channel."
+          "cargo_version output differs, pass both jobs the same exact" \
+          "toolchain, such as 1.90.0."
       fi
     done
     verification_cell="✅ Matches the digests from an earlier job; not"

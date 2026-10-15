@@ -1107,3 +1107,162 @@ jobs:
           fi
           echo "Release safeguards hold ✅"
           echo "Release safeguards hold ✅" >> "$GITHUB_STEP_SUMMARY"
+
+  ### toolchain input, against real rustup ###
+  # The two jobs of the publishing pattern must package with the same
+  # Cargo. Both runs here name an exact release other than the runner's
+  # default: rustup installs it, and it must outrank the fixture's own
+  # toolchain file, whose channel is never installed.
+  test-toolchain-input:
+    name: "Test: toolchain input"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    env:
+      PINNED_TOOLCHAIN: "1.90.0"
+      PROJECT_TOOLCHAIN: "1.89.0"
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22  # v0.12.2
+        with:
+          config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
+
+      - name: 'Harden runner (block)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A run-unique name, as in the workspace fixture, committed in a
+      # repository of its own.
+      - name: "Create fixture"
+        id: fixture
+        shell: bash
+        run: |
+          # Create fixture
+          set -euo pipefail
+          suffix="$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')"
+          name="lfreleng-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${suffix}"
+          mkdir -p pinned/src
+          printf '%s\n' '[package]' "name = \"$name\"" \
+            'version = "0.1.0"' 'edition = "2021"' \
+            'description = "Fixture for rust-crate-publish-action"' \
+            'license = "Apache-2.0"' > pinned/Cargo.toml
+          : > pinned/src/lib.rs
+          printf '%s\n' '/target' > pinned/.gitignore
+          printf '%s\n' '[toolchain]' "channel = \"$PROJECT_TOOLCHAIN\"" \
+            > pinned/rust-toolchain.toml
+          cargo generate-lockfile --offline --manifest-path pinned/Cargo.toml
+          git -C pinned init -q
+          git -C pinned add -A
+          git -C pinned -c user.name=CI -c user.email=ci@example.org \
+            -c commit.gpgsign=false commit -q -m 'Fixture'
+          default_cargo="$(cargo --version | cut -d' ' -f2)"
+          echo "default_cargo=$default_cargo" >> "$GITHUB_OUTPUT"
+
+      - name: "Running local action: verify with the toolchain input"
+        id: verify
+        uses: $/
+        with:
+          path_prefix: pinned
+          toolchain: ${{ env.PINNED_TOOLCHAIN }}
+          release_tag: v0.1.0
+          dry_run: 'true'
+
+      # The publishing job's half, short of the upload
+      - name: "Running local action: expected_sha256 with the same toolchain"
+        id: publish
+        uses: $/
+        with:
+          path_prefix: pinned
+          toolchain: ${{ env.PINNED_TOOLCHAIN }}
+          expected_sha256: ${{ steps.verify.outputs.crate_sha256 }}
+          dry_run: 'true'
+
+      - name: "Running local action: toolchain that is not a name"
+        id: invalid
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: pinned
+          toolchain: '1.90.0;id'
+          dry_run: 'true'
+
+      - name: "Running local action: toolchain rustup cannot install"
+        id: uninstallable
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: pinned
+          toolchain: '0.0.1'
+          dry_run: 'true'
+
+      - name: "Verify toolchain input outcomes"
+        shell: bash
+        env:
+          DEFAULT_CARGO: ${{ steps.fixture.outputs.default_cargo }}
+          VERIFY_TOOLCHAIN: ${{ steps.verify.outputs.toolchain }}
+          VERIFY_KIND: ${{ steps.verify.outputs.toolchain_kind }}
+          VERIFY_CARGO: ${{ steps.verify.outputs.cargo_version }}
+          VERIFY_SHA256: ${{ steps.verify.outputs.crate_sha256 }}
+          VERIFY_STATUS: ${{ steps.verify.outputs.publish_status }}
+          PUBLISH_TOOLCHAIN: ${{ steps.publish.outputs.toolchain }}
+          PUBLISH_CARGO: ${{ steps.publish.outputs.cargo_version }}
+          PUBLISH_SHA256: ${{ steps.publish.outputs.crate_sha256 }}
+          INVALID_OUTCOME: ${{ steps.invalid.outcome }}
+          INVALID_KIND: ${{ steps.invalid.outputs.toolchain_kind }}
+          UNINSTALLABLE_OUTCOME: ${{ steps.uninstallable.outcome }}
+          UNINSTALLABLE_CARGO: ${{ steps.uninstallable.outputs.cargo_version }}
+        run: |
+          # Verify toolchain input outcomes
+          errors=0
+          check() {
+            if [ "$2" != "$3" ]; then
+              echo "Unexpected $1: '$2' (expected '$3') ❌"
+              errors=1
+            fi
+          }
+          # A runner already on this release would prove nothing
+          if [ "$DEFAULT_CARGO" = "$PINNED_TOOLCHAIN" ]; then
+            echo "The runner's default cargo is $PINNED_TOOLCHAIN already ❌"
+            errors=1
+          fi
+          check "verify toolchain" "$VERIFY_TOOLCHAIN" "$PINNED_TOOLCHAIN"
+          check "verify toolchain_kind" "$VERIFY_KIND" channel
+          check "verify cargo_version" "$VERIFY_CARGO" "$PINNED_TOOLCHAIN"
+          check "verify publish_status" "$VERIFY_STATUS" dry-run
+          check "publish toolchain" "$PUBLISH_TOOLCHAIN" "$PINNED_TOOLCHAIN"
+          check "publish cargo_version" "$PUBLISH_CARGO" "$PINNED_TOOLCHAIN"
+          check "publish crate_sha256" "$PUBLISH_SHA256" "$VERIFY_SHA256"
+          check "invalid name outcome" "$INVALID_OUTCOME" failure
+          # Refused at 'Check inputs', before any toolchain output
+          check "invalid name toolchain_kind" "$INVALID_KIND" ""
+          check "uninstallable outcome" "$UNINSTALLABLE_OUTCOME" failure
+          check "uninstallable cargo_version" "$UNINSTALLABLE_CARGO" ""
+          toolchains="$(rustup toolchain list)"
+          if grep -q "^$PROJECT_TOOLCHAIN" <<< "$toolchains"; then
+            echo "The fixture's toolchain file was honoured ❌"
+            errors=1
+          fi
+          # The minimal profile leaves out rust-docs
+          components="$(rustup component list --installed \
+            --toolchain "$PINNED_TOOLCHAIN")"
+          if grep -q '^rust-docs' <<< "$components"; then
+            echo "$PINNED_TOOLCHAIN was not installed minimally ❌"
+            errors=1
+          fi
+          if [ "$errors" != 0 ]; then
+            echo "toolchain input tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "toolchain input verified: cargo $VERIFY_CARGO ✅"
+          echo "toolchain input verified: cargo $VERIFY_CARGO ✅" \
+            >> "$GITHUB_STEP_SUMMARY"

@@ -17,7 +17,8 @@ description: "Packages a Rust crate, checks its size and version, and publishes 
 # The calling workflow owns authentication, typically crates.io
 # Trusted Publishing via rust-lang/crates-io-auth-action. A named
 # 'registry' takes its sparse index URL from the caller's
-# CARGO_REGISTRIES_<NAME>_INDEX.
+# CARGO_REGISTRIES_<NAME>_INDEX. A 'toolchain' input pins one rustup
+# toolchain for every stage, installing it when missing.
 
 inputs:
   # Optional
@@ -56,6 +57,11 @@ inputs:
     description: "Largest allowed packaged .crate size in bytes (crates.io cap: 10MB)"
     required: false
     default: "10485760"
+  toolchain:
+    # yamllint disable-line rule:line-length
+    description: "rustup toolchain to package and publish with, installed if missing; empty uses the one path_prefix selects. Pass verify and publish jobs the same exact version"
+    required: false
+    default: ""
   dry_run:
     # yamllint disable-line rule:line-length
     description: "Check and package without publishing ('true'/'false'); needs no credentials"
@@ -114,6 +120,14 @@ outputs:
   cargo_version:
     description: "Cargo version that packaged the crate"
     value: ${{ steps.publish.outputs.cargo_version }}
+  toolchain:
+    # yamllint disable-line rule:line-length
+    description: "Toolchain used: the toolchain input, or the rustup channel or path path_prefix selects; empty without rustup"
+    value: ${{ steps.publish.outputs.toolchain }}
+  toolchain_kind:
+    # yamllint disable-line rule:line-length
+    description: "How the action chose the toolchain: 'channel', 'path' or 'none'"
+    value: ${{ steps.publish.outputs.toolchain_kind }}
   registry_status:
     # yamllint disable-line rule:line-length
     description: "This version on the target registry: 'absent', 'identical' (same archive) or 'different'; several crates: a JSON object"
@@ -169,6 +183,7 @@ runs:
         INPUT_EXCLUDE: ${{ inputs.exclude }}
         INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
         INPUT_MAX_CRATE_SIZE_BYTES: ${{ inputs.max_crate_size_bytes }}
+        INPUT_TOOLCHAIN: ${{ inputs.toolchain }}
         INPUT_DRY_RUN: ${{ inputs.dry_run }}
         INPUT_REGISTRY: ${{ inputs.registry }}
         INPUT_REGISTRY_TOKEN: ${{ inputs.registry_token }}

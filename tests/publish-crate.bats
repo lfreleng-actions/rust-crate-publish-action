@@ -44,6 +44,8 @@ setup() {
   export MOCK_CARGO_SETS="$workdir/cargo sets"
   export MOCK_RUSTUP_LOG="$workdir/rustup calls"
   export MOCK_RUSTUP_VARS="$workdir/rustup vars"
+  export MOCK_RUSTUP_ARGS="$workdir/rustup args"
+  export MOCK_RUSTUP_INSTALLED="$workdir/rustup installed"
   export MOCK_CURL_LOG="$workdir/curl calls"
   export MOCK_MANIFEST_JSON="$workdir/manifest.json"
   cp "$BATS_TEST_DIRNAME/fixtures/manifest.json" "$MOCK_MANIFEST_JSON"
@@ -63,6 +65,8 @@ setup() {
   unset INPUT_WORKSPACE INPUT_PACKAGES INPUT_EXCLUDE MOCK_WORKSPACE_JSON
   unset MOCK_EXPECT_PACKAGE_MANIFEST MOCK_INDEX_DIR MOCK_PUBLISH_FAIL_AT
   unset MOCK_RACE_CKSUM MOCK_INDEX_DIR_MISSING
+  unset INPUT_TOOLCHAIN MOCK_RUSTUP_INSTALL_FAIL RUSTUP_AUTO_INSTALL
+  unset MOCK_TOOLCHAIN_REASON
   # Host registry settings would reach the stand-ins and break the exact
   # scrub assertions.
   local name
@@ -75,7 +79,7 @@ setup() {
   for file in "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY" "$MOCK_CARGO_LOG" \
     "$MOCK_CARGO_ENV" "$MOCK_CARGO_TARGETS" "$MOCK_RUSTUP_LOG" \
     "$MOCK_CURL_LOG" "$MOCK_CARGO_VARS" "$MOCK_RUSTUP_VARS" \
-    "$MOCK_CARGO_SETS"; do
+    "$MOCK_CARGO_SETS" "$MOCK_RUSTUP_ARGS" "$MOCK_RUSTUP_INSTALLED"; do
     : > "$file"
   done
 }
@@ -138,6 +142,8 @@ index_entry() {
 
 readonly publish_calls=$'version\nmetadata\npackage\ndry-run\nrepackage\npublish'
 readonly dry_run_calls=$'version\nmetadata\npackage\ndry-run\nrepackage'
+# The outputs 'Check toolchain' writes for rustup's default selection.
+readonly toolchain_outputs=$'toolchain=stable-x86_64-unknown-linux-gnu\ntoolchain_kind=channel'
 
 # Describe a workspace below the project directory to the cargo
 # stand-in. Each argument is NAME:VERSION:DEPS:PUBLISH. DEPS is a comma
@@ -221,7 +227,8 @@ last_output_value() {
 
   [ "$status" -eq 0 ]
   assert_calls "$publish_calls"
-  [ "$(cat "$GITHUB_OUTPUT")" = "$(printf '%s\n' cargo_version=1.98.1 \
+  [ "$(cat "$GITHUB_OUTPUT")" = "$(printf '%s\n' "$toolchain_outputs" \
+    cargo_version=1.98.1 \
     crate_name=example-crate crate_version=1.2.3 crate_size_bytes=32 \
     "crate_sha256=$(zero_sha256 32)" registry_status=absent \
     published=true publish_status=published)" ]
@@ -248,6 +255,11 @@ last_output_value() {
   [ "$status" -eq 0 ]
   [ "$(sort -u < <(awk -F'|' '{ print $8 }' "$MOCK_CARGO_ENV"))" \
     = 1.80.0-x86_64-unknown-linux-gnu ]
+  [ "$(cat "$MOCK_RUSTUP_ARGS")" = 'unset|show active-toolchain' ]
+  [ "$(output_value toolchain)" = 1.80.0-x86_64-unknown-linux-gnu ]
+  [ "$(output_value toolchain_kind)" = channel ]
+  grep -F '| Toolchain | <code>cargo 1.98.1</code> via <code>1.80.0-x86_64-unknown-linux-gnu</code> (project) |' \
+    "$GITHUB_STEP_SUMMARY"
 }
 
 @test "packages into its own target directory, whatever CARGO_TARGET_DIR says" {
@@ -568,6 +580,66 @@ last_output_value() {
   [ "$(sort -u < <(awk -F'|' '{ print $8 }' "$MOCK_CARGO_ENV"))" = unset ]
   grep -F '| Toolchain | ⚠️ Path toolchain <code>/opt/custom</code> |' \
     "$GITHUB_STEP_SUMMARY"
+  [ "$(output_value toolchain)" = /opt/custom ]
+  [ "$(output_value toolchain_kind)" = path ]
+}
+
+# rustup appends its reason to a path, which may hold spaces and " (",
+# as may the file the reason quotes. Each rustup wording, old and new.
+@test "reports a path toolchain holding spaces in full" {
+  local reason path="/opt/my tool (chain)"
+  for reason in default \
+    "overridden by '$workdir/a (b)/rust-toolchain.toml'" \
+    "overridden by '$workdir/a (default)/rust-toolchain.toml'" \
+    'environment override by RUSTUP_TOOLCHAIN' \
+    'overridden by environment variable RUSTUP_TOOLCHAIN' \
+    "directory override for '$workdir/x (y)'" ''; do
+    # A bare path, which no current rustup prints, is taken whole when
+    # it holds no " (".
+    if [ -z "$reason" ]; then
+      path="/opt/my tool"
+    fi
+    export MOCK_TOOLCHAIN="$path" MOCK_TOOLCHAIN_REASON="$reason" \
+      INPUT_DRY_RUN=true
+    reset_logs
+    run_action
+
+    [ "$status" -eq 0 ]
+    [ "$(output_value toolchain)" = "$path" ]
+    [ "$(output_value toolchain_kind)" = path ]
+    grep -F "| Toolchain | ⚠️ Path toolchain <code>$path</code> |" \
+      "$GITHUB_STEP_SUMMARY"
+  done
+}
+
+# An unknown reason, or a quoted file holding a reason of its own, which
+# leaves two places the path could end.
+@test "refuses a path toolchain line it cannot parse" {
+  local reason
+  for reason in "chosen somehow" \
+    "overridden by '/tmp/a (overridden by 'b')/rust-toolchain.toml'"; do
+    export MOCK_TOOLCHAIN="/opt/custom" MOCK_TOOLCHAIN_REASON="$reason" \
+      INPUT_DRY_RUN=true
+    reset_logs
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"::error::rustup reported an unexpected toolchain path"* ]]
+    assert_no_cargo
+    [ "$(output_value toolchain)" = "" ]
+  done
+}
+
+# A newline inside a path splits rustup's output across lines; the first
+# line alone would name a different, shorter path.
+@test "refuses a path toolchain holding a newline" {
+  export MOCK_TOOLCHAIN=$'/opt/my\n tool' INPUT_DRY_RUN=true
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::rustup reported an unexpected toolchain path"* ]]
+  assert_no_cargo
+  [ "$(output_value toolchain)" = "" ]
 }
 
 @test "rejects an unexpected toolchain name from rustup" {
@@ -588,8 +660,11 @@ last_output_value() {
   assert_no_cargo
 }
 
-@test "works without rustup, leaving the toolchain unpinned" {
-  local tool saved_path="$PATH" found
+# Leave PATH holding the stand-ins less rustup, and the tools the
+# script needs; restore_path undoes it.
+hide_rustup() {
+  local tool found
+  saved_path="$PATH"
   rm "$workdir/bin/rustup"
   mkdir -p "$workdir/no-rustup"
   for tool in bash jq wc mktemp dirname env tr head awk grep cat tee rm \
@@ -599,12 +674,150 @@ last_output_value() {
     fi
   done
   export PATH="$workdir/bin:$workdir/no-rustup"
-  run_action
+}
+
+restore_path() {
   export PATH="$saved_path"
+}
+
+@test "works without rustup, leaving the toolchain unpinned" {
+  hide_rustup
+  run_action
+  restore_path
 
   [ "$status" -eq 0 ]
   [ "$(sort -u < <(awk -F'|' '{ print $8 }' "$MOCK_CARGO_ENV"))" = unset ]
   grep -F '(no rustup)' "$GITHUB_STEP_SUMMARY"
+  [ "$(output_value toolchain_kind)" = none ]
+  grep -qx 'toolchain=' "$GITHUB_OUTPUT"
+}
+
+### toolchain input ###
+
+@test "the toolchain input pins every stage and installs it when missing" {
+  export INPUT_TOOLCHAIN=1.90.0
+  run_action
+
+  [ "$status" -eq 0 ]
+  assert_calls "$publish_calls"
+  [ "$(sort -u < <(awk -F'|' '{ print $8 }' "$MOCK_CARGO_ENV"))" = 1.90.0 ]
+  # Probed with auto-install off, then installed minimally; rustup is
+  # never asked what the project selects.
+  [ "$(cat "$MOCK_RUSTUP_ARGS")" = "$(printf '%s\n' \
+    '0|which --toolchain 1.90.0 cargo' \
+    'unset|toolchain install 1.90.0 --profile minimal --no-self-update')" ]
+  local cwd
+  while IFS= read -r cwd; do
+    [[ "$cwd" == "$RUNNER_TEMP"/rust-crate-publish.*/cwd ]]
+  done < "$MOCK_RUSTUP_LOG"
+  [ "$(wc -l < "$MOCK_RUSTUP_LOG")" -eq 2 ]
+  [ "$(output_value toolchain)" = 1.90.0 ]
+  [ "$(output_value toolchain_kind)" = channel ]
+  [[ "$output" == *"Installing toolchain 1.90.0 (minimal profile)"* ]]
+  grep -F '| Toolchain | <code>cargo 1.98.1</code> via <code>1.90.0</code> (<code>toolchain</code> input) |' \
+    "$GITHUB_STEP_SUMMARY"
+}
+
+@test "the toolchain input pins the two-job upload and its dry run" {
+  export INPUT_TOOLCHAIN=1.90.0 INPUT_DRY_RUN=true
+  run_action
+  [ "$status" -eq 0 ]
+  assert_calls "$dry_run_calls"
+  [ "$(sort -u < <(awk -F'|' '{ print $8 }' "$MOCK_CARGO_ENV"))" = 1.90.0 ]
+
+  INPUT_EXPECTED_SHA256="$(output_value crate_sha256)"
+  export INPUT_EXPECTED_SHA256 INPUT_DRY_RUN=false
+  reset_logs
+  run_action
+  [ "$status" -eq 0 ]
+  assert_calls $'version\nmetadata\nrepackage\ndry-run\nrepackage\npublish'
+  [ "$(sort -u < <(awk -F'|' '{ print $8 }' "$MOCK_CARGO_ENV"))" = 1.90.0 ]
+  # Installed by the first run, so the second only probes.
+  [ "$(grep -c 'toolchain install' "$MOCK_RUSTUP_ARGS")" -eq 1 ]
+}
+
+@test "leaves an installed toolchain input as it is" {
+  export INPUT_TOOLCHAIN=stable
+  printf '%s\n' stable > "$MOCK_RUSTUP_INSTALLED"
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MOCK_RUSTUP_ARGS")" = '0|which --toolchain stable cargo' ]
+  [ "$(sort -u < <(awk -F'|' '{ print $8 }' "$MOCK_CARGO_ENV"))" = stable ]
+  [[ "$output" == *"Toolchain stable is installed"* ]]
+}
+
+@test "probes and installs the toolchain input without tokens or command files" {
+  export_scrubbed_variables
+  export INPUT_TOOLCHAIN=1.90.0
+  run_action
+
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$MOCK_RUSTUP_ARGS")" -eq 2 ]
+  local line kept="CARGO_REGISTRIES_PRIVATE_INDEX=sparse+https://private.example/ "
+  while IFS= read -r line; do
+    [ "$line" = "$kept" ]
+  done < "$MOCK_RUSTUP_VARS"
+  [ "$(wc -l < "$MOCK_RUSTUP_VARS")" -eq 2 ]
+}
+
+@test "the toolchain input outranks the project's toolchain selection" {
+  local selected
+  for selected in /opt/custom 1.80.0-x86_64-unknown-linux-gnu; do
+    export MOCK_TOOLCHAIN="$selected" INPUT_TOOLCHAIN=1.90.0
+    reset_logs
+    : > "$MOCK_RUSTUP_ARGS"
+    run_action
+
+    [ "$status" -eq 0 ]
+    assert_calls "$publish_calls"
+    [ "$(sort -u < <(awk -F'|' '{ print $8 }' "$MOCK_CARGO_ENV"))" = 1.90.0 ]
+    [ "$(stage_env package 2)" = "$project" ]
+    run ! grep -F 'show active-toolchain' "$MOCK_RUSTUP_ARGS"
+    [ "$(output_value toolchain_kind)" = channel ]
+  done
+}
+
+@test "rejects a toolchain input that is not a toolchain name" {
+  local value
+  # shellcheck disable=SC2016 # '$(id)' is a literal test value
+  for value in '1.90.0;id' '-V' '--help' '+stable' '.' '..' '../x' \
+    '/opt/rust' 'stable nightly' $'1.90.0\nstable' '$(id)' '1.90.0%0A' \
+    '::error::x'; do
+    export INPUT_TOOLCHAIN="$value"
+    reset_logs
+    : > "$MOCK_RUSTUP_LOG"
+    run_action
+
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"::error::toolchain must be a rustup toolchain name"* ]]
+    [[ "$output" != *"$value"* ]] || [ "${#value}" -le 2 ]
+    assert_no_cargo
+    [ ! -s "$MOCK_RUSTUP_LOG" ]
+    grep -Fx '### ❌ Failed at Check inputs' "$GITHUB_STEP_SUMMARY"
+  done
+}
+
+@test "fails clearly when rustup cannot install the toolchain input" {
+  export INPUT_TOOLCHAIN=1.0.99 MOCK_RUSTUP_INSTALL_FAIL=true
+  run_action
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::rustup could not install toolchain 1.0.99, named by the toolchain input"* ]]
+  assert_no_cargo
+  grep -Fx '### ❌ Failed at Install toolchain' "$GITHUB_STEP_SUMMARY"
+  [ "$(output_value publish_status)" = failed ]
+}
+
+@test "the toolchain input needs rustup" {
+  export INPUT_TOOLCHAIN=1.90.0
+  hide_rustup
+  run_action
+  restore_path
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"::error::toolchain needs rustup on PATH"* ]]
+  assert_no_cargo
 }
 
 ### Cargo metadata ###
@@ -640,7 +853,7 @@ last_output_value() {
 
     [ "$status" -eq 1 ]
     [[ "$output" == *"cargo metadata returned an unexpected crate"* ]]
-    [ "$(cat "$GITHUB_OUTPUT")" = $'cargo_version=1.98.1\npublished=false\npublish_status=failed' ]
+    [ "$(cat "$GITHUB_OUTPUT")" = "$toolchain_outputs"$'\ncargo_version=1.98.1\npublished=false\npublish_status=failed' ]
     assert_calls $'version\nmetadata'
   done
 }
@@ -1471,7 +1684,7 @@ export_scrubbed_variables() {
 | --- | --- |
 | Mode | Publish to crates.io |
 | Manifest | <code>member crate/Cargo.toml</code> |
-| Toolchain | <code>cargo 1.98.1</code> via <code>stable-x86_64-unknown-linux-gnu</code> |
+| Toolchain | <code>cargo 1.98.1</code> via <code>stable-x86_64-unknown-linux-gnu</code> (project) |
 | Release tag | ✅ <code>v1.2.3</code> matches |
 | Verification | ✅ Compiled and verified in this job |
 | Package size | ✅ 32 B of the 10.0 MiB limit |
@@ -1594,7 +1807,8 @@ MARKDOWN
   [ "$(cat "$MOCK_CARGO_SETS")" = "$(printf '%s\n' \
     'package zeta mid alpha' 'dry-run zeta mid alpha' \
     'repackage zeta mid alpha' 'publish zeta mid alpha')" ]
-  [ "$(cat "$GITHUB_OUTPUT")" = "$(printf '%s\n' cargo_version=1.98.1 \
+  [ "$(cat "$GITHUB_OUTPUT")" = "$(printf '%s\n' "$toolchain_outputs" \
+    cargo_version=1.98.1 \
     'crate_name=zeta mid alpha' \
     'crate_version={"zeta":"1.0.0","mid":"1.0.0","alpha":"1.0.0"}' \
     'crate_size_bytes={"zeta":36,"mid":35,"alpha":37}' \
@@ -1699,7 +1913,8 @@ MARKDOWN
   [ "$status" -eq 0 ]
   assert_calls "$publish_calls"
   [ ! -s "$MOCK_CARGO_SETS" ]
-  [ "$(cat "$GITHUB_OUTPUT")" = "$(printf '%s\n' cargo_version=1.98.1 \
+  [ "$(cat "$GITHUB_OUTPUT")" = "$(printf '%s\n' "$toolchain_outputs" \
+    cargo_version=1.98.1 \
     crate_name=mid crate_version=1.0.0 crate_size_bytes=32 \
     "crate_sha256=$(zero_sha256 32)" registry_status=absent \
     published=true publish_status=published)" ]

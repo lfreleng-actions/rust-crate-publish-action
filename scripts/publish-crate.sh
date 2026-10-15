@@ -16,13 +16,15 @@
 #   -> Dry-run publish -> Confirm package unchanged -> Publish
 #
 # A named registry adds 'Read registry config' after the workspace is
-# prepared, and checks that registry in place of crates.io.
+# prepared, and checks that registry in place of crates.io. The
+# 'toolchain' input adds 'Install toolchain' after 'Check toolchain'.
 #
 # The compiling 'Package' stage runs in the project directory, so the
 # project's Cargo configuration and toolchain apply to the build. Every
 # other stage runs from an empty directory pinned to the same rustup
 # toolchain, so a checked-in .cargo/config.toml or rust-toolchain.toml
-# cannot reach the upload. Crate code compiled in a job can still read
+# cannot reach the upload. A 'toolchain' input replaces the project's
+# toolchain for every stage, 'Package' included. Crate code compiled in a job can still read
 # that job's credentials, so for isolation verify in one job (dry_run)
 # and upload from another given expected_sha256, which compiles nothing.
 
@@ -49,6 +51,7 @@ summary="${INPUT_SUMMARY:-true}"
 expected_sha256="${INPUT_EXPECTED_SHA256:-}"
 registry_token="${INPUT_REGISTRY_TOKEN:-}"
 registry="${INPUT_REGISTRY:-}"
+toolchain_input="${INPUT_TOOLCHAIN:-}"
 # Inputs of the opt-in semver stage, scripts/semver-checks.sh.
 semver_checks="${INPUT_SEMVER_CHECKS:-false}"
 semver_tool_version="${INPUT_CARGO_SEMVER_CHECKS_VERSION-0.51.0}"
@@ -81,6 +84,8 @@ manifest_display=""
 toolchain=""
 toolchain_kind=""
 toolchain_pin=""
+# 'input' or 'project': who chose a channel toolchain.
+toolchain_source=""
 registry_status=""
 published_sha256=""
 published="false"
@@ -125,7 +130,7 @@ semver_output_baseline() {
 }
 
 render_summary() {
-  local status="$1" outcome="" subject="" link=""
+  local status="$1" outcome="" subject="" link="" chosen_by=""
   if [ "$set_mode" = "true" ]; then
     subject=": ${#set_names[@]} crates"
   elif [ -n "$crate_name" ] && [ -n "$crate_version" ]; then
@@ -157,8 +162,14 @@ render_summary() {
     summary_row "Manifest" "$(summary_code "$manifest_display")"
   fi
   case "$toolchain_kind" in
-    channel) summary_row "Toolchain" \
-      "$(summary_code "cargo ${cargo_version:-unknown}") via $(summary_code "$toolchain")" ;;
+    channel)
+      if [ "$toolchain_source" = "input" ]; then
+        chosen_by="$(summary_code toolchain) input"
+      else
+        chosen_by="project"
+      fi
+      summary_row "Toolchain" \
+        "$(summary_code "cargo ${cargo_version:-unknown}") via $(summary_code "$toolchain") ($chosen_by)" ;;
     path) summary_row "Toolchain" \
       "⚠️ Path toolchain $(summary_code "$toolchain")" ;;
     none) summary_row "Toolchain" \
@@ -537,6 +548,14 @@ if [ -n "$release_tag" ] && [[ ! "$release_tag" =~ ^[0-9A-Za-z._+-]+$ ]]; then
   fail "release_tag may contain only: 0-9 A-Z a-z . _ + -"
 fi
 
+# A rustup toolchain name, never a path. A leading letter or digit
+# keeps it from reading as a rustup option or as '.' or '..'.
+if [ -n "$toolchain_input" ] \
+  && [[ ! "$toolchain_input" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+  fail "toolchain must be a rustup toolchain name: A-Z a-z 0-9 . _ + -," \
+    "starting with a letter or digit"
+fi
+
 if expected_is_map; then
   # Parsing the map needs jq, before the tool checks below run.
   if ! command -v jq > /dev/null 2>&1; then
@@ -693,31 +712,77 @@ fi
 # then runs that directory's binaries as cargo, so a repository could
 # supply its own. 'rustup show active-toolchain' names the selection
 # without running it. Channels are rustup-managed, so they are pinned
-# for every stage; a path toolchain is never used for an upload.
+# for every stage; a path toolchain is never used for an upload. The
+# toolchain input names a channel itself, so rustup is not asked, and
+# the pin outranks any rust-toolchain file.
 stage="Check toolchain"
-if command -v rustup > /dev/null 2>&1; then
+if ! command -v rustup > /dev/null 2>&1; then
+  if [ -n "$toolchain_input" ]; then
+    fail "toolchain needs rustup on PATH"
+  fi
+  toolchain_kind="none"
+elif [ -n "$toolchain_input" ]; then
+  toolchain="$toolchain_input"
+  toolchain_kind="channel"
+  toolchain_pin="$toolchain"
+  toolchain_source="input"
+else
   build_scrub
   if ! toolchain="$(cd -- "$project_dir" \
     && env "${scrub_args[@]}" rustup show active-toolchain 2> /dev/null)"; then
     fail "could not determine the Rust toolchain rustup selects for" \
       "path_prefix"
   fi
+  raw_toolchain="$toolchain"
   toolchain="${toolchain%%$'\n'*}"
-  toolchain="${toolchain%% *}"
   case "$toolchain" in
-    /*) toolchain_kind="path" ;;
+    /*)
+      # rustup prints "<name> (<reason>)", and a path, like the file a
+      # reason quotes, may hold spaces or " (". Strip the one whole
+      # reason, in the wording of any rustup release. A path or file
+      # holding a reason of its own makes the line ambiguous: refuse it.
+      # So does a second line, which a newline inside the path would
+      # produce: check the whole output, not the first line alone.
+      if [[ "$raw_toolchain" == *[[:cntrl:]]* ]]; then
+        toolchain=""
+        fail "rustup reported an unexpected toolchain path for path_prefix"
+      fi
+      reason_pattern="^ \\((default|environment override by RUSTUP_TOOLCHAIN|overridden by (environment variable RUSTUP_TOOLCHAIN|\\+toolchain on the command line|'.*')|directory override for '.*')\\)\$"
+      line="$toolchain"
+      toolchain=""
+      matches=0
+      if [[ "$line" != *" ("* ]]; then
+        toolchain="$line"
+        matches=1
+      fi
+      name_part="$line"
+      while [[ "$name_part" == ?*" ("* ]]; do
+        name_part="${name_part% (*}"
+        if [[ "${line:${#name_part}}" =~ $reason_pattern ]]; then
+          toolchain="$name_part"
+          matches=$((matches + 1))
+        fi
+      done
+      if [ "$matches" -ne 1 ] || [[ "$toolchain" == *[[:cntrl:]]* ]]; then
+        toolchain=""
+        fail "rustup reported an unexpected toolchain path for path_prefix"
+      fi
+      toolchain_kind="path"
+      ;;
     *)
+      toolchain="${toolchain%% *}"
       if [[ ! "$toolchain" =~ ^[A-Za-z0-9._+-]+$ ]]; then
         toolchain=""
         fail "rustup reported an unexpected toolchain name for path_prefix"
       fi
       toolchain_kind="channel"
       toolchain_pin="$toolchain"
+      toolchain_source="project"
       ;;
   esac
-else
-  toolchain_kind="none"
 fi
+write_output toolchain "$toolchain"
+write_output toolchain_kind "$toolchain_kind"
 
 if [ "$toolchain_kind" = "path" ]; then
   if [ "$release_intent" = "true" ]; then
@@ -730,6 +795,35 @@ if [ "$toolchain_kind" = "path" ]; then
   # Nothing is uploaded, and only that toolchain can reproduce its own
   # archives, so the remaining stages stay in the project context.
   trusted_dir="$project_dir"
+fi
+
+### Install toolchain ###
+
+# Install the toolchain the input names when rustup lacks it, with the
+# minimal profile and without updating rustup itself. With
+# RUSTUP_AUTO_INSTALL=0 the probe cannot install it on rustup's own
+# terms, and an installed toolchain is used as it is, so a moving
+# channel such as 'stable' is not updated: name an exact version to fix
+# the Cargo release. Both run from the empty directory, scrubbed like
+# every Cargo stage, so neither project configuration nor credentials
+# reach rustup.
+if [ -n "$toolchain_input" ]; then
+  stage="Install toolchain"
+  build_scrub
+  if (cd -- "$trusted_dir" \
+    && exec env "${scrub_args[@]}" RUSTUP_AUTO_INSTALL=0 \
+      rustup which --toolchain "$toolchain_pin" cargo) > /dev/null 2>&1; then
+    echo "Toolchain $toolchain_pin is installed"
+  else
+    echo "Installing toolchain $toolchain_pin (minimal profile)"
+    if ! (cd -- "$trusted_dir" \
+      && exec env "${scrub_args[@]}" rustup toolchain install \
+        "$toolchain_pin" --profile minimal --no-self-update); then
+      fail "rustup could not install toolchain $toolchain_pin, named by" \
+        "the toolchain input; check that it names a release rustup" \
+        "can install, such as 1.90.0 or stable"
+    fi
+  fi
 fi
 
 cargo_version="$(trusted_cargo --version)"
@@ -850,8 +944,8 @@ if [ -n "$expected_sha256" ]; then
     verification_cell="❌ Differs from the verified digest"
     fail "$crate_name package does not match expected_sha256; not" \
       "publishing. This job packaged it with cargo $cargo_version; if" \
-      "the verifying job's cargo_version output differs, pin an exact" \
-      "toolchain channel."
+      "the verifying job's cargo_version output differs, pass both jobs" \
+      "the same exact toolchain, such as 1.90.0."
   fi
   verification_cell="✅ Matches the digest from an earlier job; not compiled here"
   echo "$crate_name package matches expected_sha256 ✅"
