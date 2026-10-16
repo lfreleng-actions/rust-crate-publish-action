@@ -18,6 +18,9 @@
 # A named registry adds 'Read registry config' after the workspace is
 # prepared, and checks that registry in place of crates.io. The
 # 'toolchain' input adds 'Install toolchain' after 'Check toolchain'.
+# The 'version' input adds 'Stamp version' before 'Read crate
+# metadata', which writes that version over the placeholder 0.0.0 in
+# the checkout (scripts/version-stamp.sh).
 #
 # The compiling 'Package' stage runs in the project directory, so the
 # project's Cargo configuration and toolchain apply to the build. Every
@@ -37,6 +40,8 @@ source "$script_dir/job-summary.sh"
 source "$script_dir/workspace.sh"
 # shellcheck source=semver-checks.sh
 source "$script_dir/semver-checks.sh"
+# shellcheck source=version-stamp.sh
+source "$script_dir/version-stamp.sh"
 
 path_prefix="${INPUT_PATH_PREFIX:-.}"
 manifest_path="${INPUT_MANIFEST_PATH:-Cargo.toml}"
@@ -52,6 +57,7 @@ expected_sha256="${INPUT_EXPECTED_SHA256:-}"
 registry_token="${INPUT_REGISTRY_TOKEN:-}"
 registry="${INPUT_REGISTRY:-}"
 toolchain_input="${INPUT_TOOLCHAIN:-}"
+version_input="${INPUT_VERSION:-}"
 # Inputs of the opt-in semver stage, scripts/semver-checks.sh.
 semver_checks="${INPUT_SEMVER_CHECKS:-false}"
 semver_tool_version="${INPUT_CARGO_SEMVER_CHECKS_VERSION-0.51.0}"
@@ -100,6 +106,7 @@ else
   tag_cell="➖ Not requested"
 fi
 verification_cell="⏸️ Not reached"
+version_cell="⏸️ Not reached"
 size_cell="⏸️ Not reached"
 registry_cell="⏸️ Not reached"
 
@@ -175,6 +182,9 @@ render_summary() {
     none) summary_row "Toolchain" \
       "$(summary_code "cargo ${cargo_version:-unknown}") (no rustup)" ;;
   esac
+  if [ -n "$version_input" ]; then
+    summary_row "Version" "$version_cell"
+  fi
   summary_row "Release tag" "$tag_cell"
   summary_row "Verification" "$verification_cell"
   if [ "$set_mode" = "true" ]; then
@@ -548,6 +558,8 @@ if [ -n "$release_tag" ] && [[ ! "$release_tag" =~ ^[0-9A-Za-z._+-]+$ ]]; then
   fail "release_tag may contain only: 0-9 A-Z a-z . _ + -"
 fi
 
+stamp_check_input
+
 # A rustup toolchain name, never a path. A leading letter or digit
 # keeps it from reading as a rustup option or as '.' or '..'.
 if [ -n "$toolchain_input" ] \
@@ -835,6 +847,12 @@ fi
 write_output cargo_version "$cargo_version"
 echo "Toolchain: ${toolchain:-cargo on PATH} (cargo $cargo_version)"
 
+### Stamp version ###
+
+# Before any packaging, so every Cargo call below sees the release
+# version (scripts/version-stamp.sh).
+stamp_version_stage
+
 ### Read crate metadata ###
 
 stage="Read crate metadata"
@@ -906,12 +924,12 @@ stage="Package"
 crate_file="$package_target/package/$crate_name-$crate_version.crate"
 if [ -n "$expected_sha256" ]; then
   trusted_cargo package --no-verify --locked \
-    ${package_registry[@]+"${package_registry[@]}"} \
+    ${dirty_args[@]+"${dirty_args[@]}"} ${package_registry[@]+"${package_registry[@]}"} \
     --target-dir "$package_target" --manifest-path "$manifest_abs"
   verification_cell="⏸️ Awaiting digest match"
 else
   cargo_with_annotations project_cargo package --locked \
-    ${package_registry[@]+"${package_registry[@]}"} \
+    ${dirty_args[@]+"${dirty_args[@]}"} ${package_registry[@]+"${package_registry[@]}"} \
     --target-dir "$package_target" --manifest-path "$manifest_abs"
   verification_cell="✅ Compiled and verified in this job"
 fi
@@ -997,8 +1015,8 @@ semver_check_stage
 # Registry-side checks only: nothing here compiles.
 stage="Dry-run publish"
 cargo_with_annotations trusted_cargo publish --dry-run --no-verify --locked \
-  --registry "$publish_registry" --target-dir "$package_target" \
-  --manifest-path "$manifest_abs"
+  ${dirty_args[@]+"${dirty_args[@]}"} --registry "$publish_registry" \
+  --target-dir "$package_target" --manifest-path "$manifest_abs"
 
 ### Confirm package unchanged ###
 
@@ -1010,8 +1028,9 @@ cargo_with_annotations trusted_cargo publish --dry-run --no-verify --locked \
 # a byte-identical result: Cargo's archives are reproducible, and they
 # record the commit, so any change to the packaged inputs shows here.
 stage="Confirm package unchanged"
+stamp_recheck_tree
 trusted_cargo package --no-verify --locked \
-  ${package_registry[@]+"${package_registry[@]}"} \
+  ${dirty_args[@]+"${dirty_args[@]}"} ${package_registry[@]+"${package_registry[@]}"} \
   --target-dir "$package_target" --manifest-path "$manifest_abs"
 if [ ! -f "$crate_file" ] \
   || [ "$(sha256_of "$crate_file")" != "$crate_sha256" ]; then
@@ -1027,8 +1046,10 @@ fi
 
 stage="Publish"
 describe_trusted_publisher
+stamp_recheck_tree
 upload_status=0
-publishing_cargo publish --no-verify --locked --registry "$publish_registry" \
+publishing_cargo publish --no-verify --locked \
+  ${dirty_args[@]+"${dirty_args[@]}"} --registry "$publish_registry" \
   --target-dir "$package_target" --manifest-path "$manifest_abs" \
   || upload_status=$?
 if [ "$upload_status" -ne 0 ]; then
