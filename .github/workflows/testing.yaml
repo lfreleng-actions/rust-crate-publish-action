@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 10
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
         with:
           config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
@@ -72,7 +72,7 @@ jobs:
     timeout-minutes: 15
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
         with:
           config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
@@ -219,7 +219,7 @@ jobs:
     timeout-minutes: 15
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
         with:
           config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
@@ -409,7 +409,7 @@ jobs:
     timeout-minutes: 15
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
         with:
           config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
@@ -580,7 +580,7 @@ jobs:
     timeout-minutes: 15
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
         with:
           config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
@@ -689,7 +689,7 @@ jobs:
       CARGO_REGISTRIES_INDEX_MIRROR_INDEX: "sparse+https://index.crates.io/"
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
         with:
           config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
@@ -788,7 +788,7 @@ jobs:
     timeout-minutes: 20
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
         with:
           config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
@@ -931,7 +931,7 @@ jobs:
     timeout-minutes: 10
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
         with:
           config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
@@ -1141,7 +1141,7 @@ jobs:
     timeout-minutes: 10
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
         with:
           config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
@@ -1294,7 +1294,7 @@ jobs:
       PROJECT_TOOLCHAIN: "1.89.0"
     steps:
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@51ef68401547a8b648275129b9a21544612596d5  # v0.13.1
+      - uses: lfreleng-actions/harden-runner-block-action@e5e8179f45aa893b23cc8b5d2e25466355d9c4f8  # v0.14.0
         with:
           config: '@2fbf4b0c1098f5e658b75ac019bb039b76fee9b6'  # v0.16.3
 
